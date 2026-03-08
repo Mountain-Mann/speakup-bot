@@ -40,8 +40,9 @@ TASK_SOURCE_CHANNEL_ID = -1003530416415
 # Admin chat ID where you want to receive student voice replies
 ADMIN_FEEDBACK_CHAT_ID = 1253972975
 
-# Google Sheets configuration
-GOOGLE_SERVICE_ACCOUNT_JSON = "service_account.json"
+# Google Sheets configuration (path relative to this script so it works from any cwd)
+_BOT_DIR = os.path.dirname(os.path.abspath(__file__))
+GOOGLE_SERVICE_ACCOUNT_JSON = os.path.join(_BOT_DIR, "service_account.json")
 SPREADSHEET_NAME = "SpeakUp!"
 STUDENTS_SHEET_NAME = "Students1"
 
@@ -254,7 +255,7 @@ def handle_voice(message: types.Message):
         # Download audio
         file_info = bot.get_file(message.voice.file_id)
         downloaded_file = bot.download_file(file_info.file_path)
-        temp_path = "temp_reply.ogg"
+        temp_path = os.path.join(_BOT_DIR, "temp_reply.ogg")
         with open(temp_path, "wb") as f:
             f.write(downloaded_file)
 
