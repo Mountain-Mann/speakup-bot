@@ -46,6 +46,15 @@ GOOGLE_SERVICE_ACCOUNT_JSON = os.path.join(_BOT_DIR, "service_account.json")
 SPREADSHEET_NAME = "SpeakUp!"
 STUDENTS_SHEET_NAME = "Students1"
 
+# On Railway/Heroku: no file on disk. Set env var GOOGLE_CREDENTIALS_JSON to the full JSON
+# content of your service account key; we write it to service_account.json at startup.
+_creds_json = os.getenv("GOOGLE_CREDENTIALS_JSON")
+if _creds_json:
+    with open(GOOGLE_SERVICE_ACCOUNT_JSON, "w") as f:
+        f.write(_creds_json)
+elif not os.path.exists(GOOGLE_SERVICE_ACCOUNT_JSON):
+    print("ERROR: service_account.json not found and GOOGLE_CREDENTIALS_JSON not set. Set GOOGLE_CREDENTIALS_JSON on Railway to the full JSON key.")
+
 # =======================
 # GOOGLE SHEETS SETUP
 # =======================
