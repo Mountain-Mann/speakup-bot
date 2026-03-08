@@ -2,4 +2,6 @@ pyTelegramBotAPI
 gspread
 oauth2client
 schedule
+openai
+python-dotenv
 
