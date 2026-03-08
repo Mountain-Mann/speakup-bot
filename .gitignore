@@ -1,0 +1,17 @@
+# Secrets
+service_account.json
+.env
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+.eggs/
+
+# Bot temp files
+temp_reply.ogg
+
+# OS
+.DS_Store

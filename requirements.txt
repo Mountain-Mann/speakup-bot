@@ -1,0 +1,5 @@
+pyTelegramBotAPI
+gspread
+oauth2client
+schedule
+
