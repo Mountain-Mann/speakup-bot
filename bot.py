@@ -45,14 +45,18 @@ LEVEL_CHANNELS = {
 # Your DM with the bot (receive student voice replies + transcript/draft here)
 ADMIN_FEEDBACK_CHAT_ID = 1253972975
 
-# Work chat group (you + partner); student voice results are also sent here
+# Work chat group (you + partner); student voice results are also sent here (bot must be in the group)
 WORK_CHAT_ID = -5158365422
+# Partner's DM (so they get practice/test results even if work chat fails)
+PARTNER_CHAT_ID = 515525969
 
 # Google Sheets configuration (path relative to this script so it works from any cwd)
 _BOT_DIR = os.path.dirname(os.path.abspath(__file__))
 GOOGLE_SERVICE_ACCOUNT_JSON = os.path.join(_BOT_DIR, "service_account.json")
 SPREADSHEET_NAME = "SpeakUp!"
-STUDENTS_SHEET_NAME = "Students1"
+STUDENTS_SHEET_NAME = "Students"
+# Real "Students" tab columns A1–K1: Name, Telegram Handle, Chat ID, Telephone, Student ID, Level, Tier End Date, Tasks Sent This Week, Tasks Due Today, Balance Due, Notes
+STUDENTS_HEADERS = ["Name", "Telegram Handle", "Chat ID", "Telephone", "Student ID", "Level", "Tier End Date", "Tasks Sent This Week", "Tasks Due Today", "Balance Due", "Notes"]
 
 # On Railway/Heroku: no file on disk. Set env var GOOGLE_CREDENTIALS_JSON to the full JSON
 # content of your service account key; we write it to service_account.json at startup.
@@ -83,40 +87,36 @@ def get_students_worksheet():
     try:
         ws = spreadsheet.worksheet(STUDENTS_SHEET_NAME)
     except gspread.WorksheetNotFound:
-        ws = spreadsheet.add_worksheet(title=STUDENTS_SHEET_NAME, rows="1000", cols="3")
-    values = ws.get_all_values()
-    # Ensure header row exists and is correct
-    expected_header = ["chat_id", "level"]
-    if not values:
-        ws.append_row(expected_header)
-    else:
-        first_row = [str(c).strip() for c in values[0]]
-        # If header is missing or incorrect, overwrite row 1
-        if first_row[:2] != expected_header:
-            ws.update("A1:B1", [expected_header])
+        ws = spreadsheet.add_worksheet(title=STUDENTS_SHEET_NAME, rows="1000", cols=len(STUDENTS_HEADERS))
+        ws.append_row(STUDENTS_HEADERS)
     return ws
 
-def register_student(chat_id: int, level: str):
+def register_student(chat_id: int, level: str, name: str = "", telegram_handle: str = ""):
     ws = get_students_worksheet()
     all_rows = ws.get_all_records()
     row_index_to_update = None
     for idx, row in enumerate(all_rows, start=2):
-        if str(row.get("chat_id")) == str(chat_id):
+        if str(row.get("Chat ID")) == str(chat_id):
             row_index_to_update = idx
             break
     if row_index_to_update:
-        ws.update_cell(row_index_to_update, 2, level)
+        ws.update_cell(row_index_to_update, 6, level)  # Level = column F
     else:
-        ws.append_row([str(chat_id), level])
+        ws.append_row([
+            name or "",
+            telegram_handle or "",
+            str(chat_id),
+            "", "", level, "", "", "", "", "",
+        ])
 
 def get_students_by_level(level: str) -> List[int]:
     ws = get_students_worksheet()
     all_rows = ws.get_all_records()
     chat_ids: List[int] = []
     for row in all_rows:
-        if str(row.get("level")).strip().lower() == level.strip().lower():
+        if str(row.get("Level", "")).strip().lower() == level.strip().lower():
             try:
-                chat_ids.append(int(row.get("chat_id")))
+                chat_ids.append(int(row.get("Chat ID")))
             except (TypeError, ValueError):
                 continue
     return chat_ids
@@ -364,11 +364,19 @@ def handle_voice(message: types.Message):
             except Exception:
                 pass
             bot.send_message(ADMIN_FEEDBACK_CHAT_ID, info_text)
+            # Partner gets a copy in their DM
+            try:
+                bot.forward_message(PARTNER_CHAT_ID, chat_id, message.message_id)
+                bot.send_message(PARTNER_CHAT_ID, info_text)
+            except Exception as e:
+                print(f"Could not send practice result to partner: {e}")
+            # Work chat (bot must be added to the group)
             try:
                 bot.forward_message(WORK_CHAT_ID, chat_id, message.message_id)
                 bot.send_message(WORK_CHAT_ID, info_text)
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"Could not send to work chat (is the bot in the group?): {e}")
+                bot.send_message(ADMIN_FEEDBACK_CHAT_ID, "⚠️ Couldn't post to work chat. Add the bot to the group if you haven't.")
         except Exception as e:
             print(f"Test voice error: {e}")
             bot.send_message(ADMIN_FEEDBACK_CHAT_ID, f"Test voice error: {e}")
@@ -394,8 +402,8 @@ def handle_voice(message: types.Message):
         ws = get_students_worksheet()
         records = ws.get_all_records()
         for row in records:
-            if str(row.get("chat_id")) == str(chat_id):
-                level = row.get("level", "Unknown")
+            if str(row.get("Chat ID")) == str(chat_id):
+                level = row.get("Level", "Unknown")
                 break
 
         transcript, ai_draft = _run_transcribe_and_draft(temp_path, level)
