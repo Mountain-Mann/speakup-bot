@@ -264,9 +264,22 @@ def _run_transcribe_and_draft(temp_path: str, level: str) -> tuple:
         try:
             with open(temp_path, "rb") as audio_file:
                 transcript_resp = openai_client.audio.transcriptions.create(
-                    model="whisper-1", file=audio_file, language="en"
+                    model="whisper-1",
+                    file=audio_file,
+                    response_format="verbose_json",
+                    prompt="Transcribe the entire recording. Include all speech from start to end, even after long pauses.",
                 )
-            transcript = transcript_resp.text.strip() or "(empty)"
+            # Join all segments so we don't miss anything after pauses
+            segments = getattr(transcript_resp, "segments", None)
+            if segments:
+                parts = []
+                for s in segments:
+                    t = s.get("text", "") if isinstance(s, dict) else getattr(s, "text", "")
+                    if t:
+                        parts.append(t.strip())
+                transcript = " ".join(parts).strip() or "(empty)"
+            else:
+                transcript = (getattr(transcript_resp, "text", None) or "").strip() or "(empty)"
         except Exception as e:
             transcript = f"[Whisper error: {e}]"
         try:
