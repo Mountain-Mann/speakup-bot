@@ -31,14 +31,22 @@ if not OPENAI_API_KEY:
 else:
     openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
-# Telegram numeric user IDs for admins
-ADMIN_IDS = [1253972975]
+# Telegram numeric user IDs for admins (you + business partner)
+ADMIN_IDS = [1253972975, 515525969]
 
-# Private channel that holds the tasks (e.g. -1001234567890)
-TASK_SOURCE_CHANNEL_ID = -1003530416415
+# Level-specific task library channels (forward tasks from here by level)
+LEVEL_CHANNELS = {
+    "A1": -1003853572928,
+    "A2": -1003790553224,
+    "B1": -1003750480222,
+    "B2": -1003530416415,
+}
 
-# Admin chat ID where you want to receive student voice replies
+# Your DM with the bot (receive student voice replies + transcript/draft here)
 ADMIN_FEEDBACK_CHAT_ID = 1253972975
+
+# Work chat group (you + partner); student voice results are also sent here
+WORK_CHAT_ID = -5158365422
 
 # Google Sheets configuration (path relative to this script so it works from any cwd)
 _BOT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -166,7 +174,14 @@ def handle_sendtask(message: types.Message):
             "Example: <code>/sendtask A1 123</code>",
         )
         return
-    level = parts[1]
+    level = parts[1].strip().upper()
+    channel_id = LEVEL_CHANNELS.get(level)
+    if not channel_id:
+        bot.reply_to(
+            message,
+            f"Unknown level <b>{level}</b>. Use one of: A1, A2, B1, B2.",
+        )
+        return
     try:
         task_message_id = int(parts[2])
     except ValueError:
@@ -181,7 +196,7 @@ def handle_sendtask(message: types.Message):
         try:
             bot.forward_message(
                 chat_id=student_chat_id,
-                from_chat_id=TASK_SOURCE_CHANNEL_ID,
+                from_chat_id=channel_id,
                 message_id=task_message_id,
             )
             sent_count += 1
@@ -189,7 +204,7 @@ def handle_sendtask(message: types.Message):
             print(f"Failed to forward to {student_chat_id}: {exc}")
     bot.reply_to(
         message,
-        f"Forwarded task <code>{task_message_id}</code> to {sent_count} student(s) of level <b>{level}</b>.",
+        f"Forwarded task <code>{task_message_id}</code> from {level} library to {sent_count} student(s).",
     )
 
 # =======================
@@ -199,29 +214,35 @@ def handle_sendtask(message: types.Message):
 def handle_sendtask_to(message: types.Message):
     """
     Usage (admin only):
-    /sendtaskto <chat_id> <task_message_id>
+    /sendtaskto <level> <chat_id> <task_message_id>
+    Uses the task library channel for that level (A1, A2, B1, B2).
     """
     if not is_admin(message.from_user.id):
         bot.reply_to(message, "You are not authorized to use this command.")
         return
     parts = message.text.strip().split()
-    if len(parts) != 3:
+    if len(parts) != 4:
         bot.reply_to(
             message,
-            "Usage: <code>/sendtaskto &lt;chat_id&gt; &lt;task_message_id&gt;</code>\n"
-            "Example: <code>/sendtaskto 123456789 7</code>",
+            "Usage: <code>/sendtaskto &lt;level&gt; &lt;chat_id&gt; &lt;task_message_id&gt;</code>\n"
+            "Example: <code>/sendtaskto A1 123456789 7</code>",
         )
         return
+    level = parts[1].strip().upper()
+    channel_id = LEVEL_CHANNELS.get(level)
+    if not channel_id:
+        bot.reply_to(message, f"Unknown level <b>{level}</b>. Use: A1, A2, B1, B2.")
+        return
     try:
-        target_chat_id = int(parts[1])
-        task_message_id = int(parts[2])
+        target_chat_id = int(parts[2])
+        task_message_id = int(parts[3])
     except ValueError:
-        bot.reply_to(message, "Both chat_id and task_message_id must be integers.")
+        bot.reply_to(message, "chat_id and task_message_id must be integers.")
         return
     try:
         bot.forward_message(
             chat_id=target_chat_id,
-            from_chat_id=TASK_SOURCE_CHANNEL_ID,
+            from_chat_id=channel_id,
             message_id=task_message_id,
         )
     except Exception as exc:
@@ -229,46 +250,134 @@ def handle_sendtask_to(message: types.Message):
         return
     bot.reply_to(
         message,
-        f"Forwarded task <code>{task_message_id}</code> to chat <code>{target_chat_id}</code>.",
+        f"Forwarded {level} task <code>{task_message_id}</code> to chat <code>{target_chat_id}</code>.",
     )
 
 # =======================
 # VOICE HANDLER (with AI transcription + draft)
 # =======================
+def _run_transcribe_and_draft(temp_path: str, level: str) -> tuple:
+    """Returns (transcript, ai_draft)."""
+    transcript = "[Transcription unavailable - set OPENAI_API_KEY]"
+    ai_draft = "[AI feedback unavailable - set OPENAI_API_KEY]"
+    if openai_client:
+        try:
+            with open(temp_path, "rb") as audio_file:
+                transcript_resp = openai_client.audio.transcriptions.create(
+                    model="whisper-1", file=audio_file, language="en"
+                )
+            transcript = transcript_resp.text.strip() or "(empty)"
+        except Exception as e:
+            transcript = f"[Whisper error: {e}]"
+        try:
+            prompt = f"""You are an ESL teacher. Student level: {level}
+Transcript of their spoken response: "{transcript}"
+Create short, encouraging feedback (60-100 words): positive comment, 1-2 improvements, end with motivation. Friendly tone."""
+            response = openai_client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=150,
+                temperature=0.7,
+            )
+            ai_draft = response.choices[0].message.content.strip()
+        except Exception as e:
+            ai_draft = f"[GPT error: {e}]"
+    return transcript, ai_draft
+
+
+def _send_voice_result_to_chats(
+    from_chat_id: int,
+    message_id: int,
+    info_text: str,
+    send_to_work_chat: bool = True,
+):
+    """Forward voice and send info to admin chat; optionally to work chat too."""
+    fwd_admin = bot.forward_message(ADMIN_FEEDBACK_CHAT_ID, from_chat_id, message_id)
+    bot.send_message(
+        ADMIN_FEEDBACK_CHAT_ID,
+        info_text,
+        reply_to_message_id=fwd_admin.message_id,
+    )
+    if send_to_work_chat:
+        try:
+            bot.forward_message(WORK_CHAT_ID, from_chat_id, message_id)
+            bot.send_message(WORK_CHAT_ID, info_text)
+        except Exception as e:
+            print(f"Failed to send to work chat: {e}")
+
+
 @bot.message_handler(content_types=["voice"])
 def handle_voice(message: types.Message):
     chat_id = message.chat.id
+    from_id = message.from_user.id if message.from_user else None
 
-    # If this is YOUR feedback reply → send to student
-    if chat_id == ADMIN_FEEDBACK_CHAT_ID:
-        if message.reply_to_message and message.reply_to_message.forward_from:
-            student_id = message.reply_to_message.forward_from.id
+    # 1) Admin replying with voice to a forwarded student message → send feedback to student
+    if chat_id == ADMIN_FEEDBACK_CHAT_ID and message.reply_to_message:
+        fwd = getattr(message.reply_to_message, "forward_from", None)
+        if fwd:
             try:
                 bot.send_voice(
-                    student_id,
+                    fwd.id,
                     message.voice.file_id,
-                    caption="🎤 Personalized feedback from your teacher! Keep going!"
+                    caption="🎤 Personalized feedback from your teacher! Keep going!",
                 )
                 bot.reply_to(message, "Feedback sent to student!")
             except Exception as e:
                 bot.reply_to(message, f"Failed to send: {e}")
+            return
+
+    # 2) Admin test/practice: you (or partner) send a voice in your DM or work chat → transcribe + draft, send to both
+    is_admin_chat = chat_id in (ADMIN_FEEDBACK_CHAT_ID, WORK_CHAT_ID)
+    is_reply_to_student = message.reply_to_message and getattr(
+        message.reply_to_message, "forward_from", None
+    )
+    if is_admin_chat and from_id in ADMIN_IDS and not is_reply_to_student:
+        level_label = "Practice (forwarded)" if (getattr(message, "forward_from", None) or getattr(message, "forward_date", None)) else "Test"
+        temp_path = None
+        try:
+            file_info = bot.get_file(message.voice.file_id)
+            downloaded_file = bot.download_file(file_info.file_path)
+            temp_path = os.path.join(_BOT_DIR, "temp_reply.ogg")
+            with open(temp_path, "wb") as f:
+                f.write(downloaded_file)
+            transcript, ai_draft = _run_transcribe_and_draft(temp_path, level_label)
+            info_text = (
+                f"🧪 {level_label} voice\n"
+                f"Transcript:\n{transcript}\n\n"
+                f"AI Draft Feedback:\n{ai_draft}"
+            )
+            try:
+                bot.forward_message(ADMIN_FEEDBACK_CHAT_ID, chat_id, message.message_id)
+            except Exception:
+                pass
+            bot.send_message(ADMIN_FEEDBACK_CHAT_ID, info_text)
+            try:
+                bot.forward_message(WORK_CHAT_ID, chat_id, message.message_id)
+                bot.send_message(WORK_CHAT_ID, info_text)
+            except Exception:
+                pass
+        except Exception as e:
+            print(f"Test voice error: {e}")
+            bot.send_message(ADMIN_FEEDBACK_CHAT_ID, f"Test voice error: {e}")
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
         return
 
-    # Student voice reply → process & forward with AI
+    # 3) Student voice → process and forward to admin + work chat
     temp_path = None
-    transcript = "[Transcription unavailable - set OPENAI_API_KEY in .env or environment]"
-    ai_draft = "[AI feedback unavailable - set OPENAI_API_KEY in .env or environment]"
+    transcript = "[Transcription unavailable - set OPENAI_API_KEY]"
+    ai_draft = "[AI feedback unavailable - set OPENAI_API_KEY]"
     level = "Unknown"
-
     try:
-        # Download audio
         file_info = bot.get_file(message.voice.file_id)
         downloaded_file = bot.download_file(file_info.file_path)
         temp_path = os.path.join(_BOT_DIR, "temp_reply.ogg")
         with open(temp_path, "wb") as f:
             f.write(downloaded_file)
 
-        # Get student level (needed for AI draft)
         ws = get_students_worksheet()
         records = ws.get_all_records()
         for row in records:
@@ -276,60 +385,16 @@ def handle_voice(message: types.Message):
                 level = row.get("level", "Unknown")
                 break
 
-        # Transcribe (Whisper)
-        if openai_client:
-            try:
-                with open(temp_path, "rb") as audio_file:
-                    transcript_resp = openai_client.audio.transcriptions.create(
-                        model="whisper-1",
-                        file=audio_file,
-                        language="en"
-                    )
-                transcript = transcript_resp.text.strip() or "(empty)"
-            except Exception as e:
-                transcript = f"[Whisper error: {e}]"
-        # else: keep placeholder
-
-        # Generate AI draft (uses transcript)
-        if openai_client:
-            try:
-                prompt = f"""
-You are an ESL teacher. Student level: {level}
-Transcript of their spoken response: "{transcript}"
-
-Create short, encouraging feedback (60-100 words):
-- Start with positive comment
-- Mention 1-2 improvements (grammar, vocab, structure)
-- End with motivation
-Use friendly, supportive tone.
-"""
-                response = openai_client.chat.completions.create(
-                    model="gpt-4o-mini",
-                    messages=[{"role": "user", "content": prompt}],
-                    max_tokens=150,
-                    temperature=0.7
-                )
-                ai_draft = response.choices[0].message.content.strip()
-            except Exception as e:
-                ai_draft = f"[GPT error: {e}]"
-        # else: keep placeholder
-
-        # Forward original voice to admin
-        forwarded = bot.forward_message(
-            ADMIN_FEEDBACK_CHAT_ID,
-            chat_id,
-            message.message_id
-        )
+        transcript, ai_draft = _run_transcribe_and_draft(temp_path, level)
         info_text = (
             f"🗣️ New voice reply to review\n"
             f"Student Chat ID: <code>{chat_id}</code>\n"
             f"Level: <b>{level}</b>\n"
             f"Transcript:\n{transcript}\n\n"
             f"AI Draft Feedback:\n{ai_draft}\n\n"
-            f"Reply to this message with your voice (read draft + add pronunciation notes)."
+            f"Reply to the voice (in your bot DM) with your voice to send feedback to the student."
         )
-        bot.send_message(ADMIN_FEEDBACK_CHAT_ID, info_text, reply_to_message_id=forwarded.message_id)
-
+        _send_voice_result_to_chats(chat_id, message.message_id, info_text)
     except Exception as e:
         print(f"Voice processing error: {e}")
         import traceback
@@ -338,11 +403,15 @@ Use friendly, supportive tone.
             bot.forward_message(ADMIN_FEEDBACK_CHAT_ID, chat_id, message.message_id)
             bot.send_message(
                 ADMIN_FEEDBACK_CHAT_ID,
-                f"Error before sending transcript/draft (voice forwarded above): {e}"
+                f"Error (voice forwarded above): {e}",
             )
+            try:
+                bot.forward_message(WORK_CHAT_ID, chat_id, message.message_id)
+                bot.send_message(WORK_CHAT_ID, f"Error: {e}")
+            except Exception:
+                pass
         except Exception:
             pass
-
     if temp_path and os.path.exists(temp_path):
         try:
             os.remove(temp_path)
@@ -353,34 +422,38 @@ Use friendly, supportive tone.
 # SCHEDULING
 # =======================
 def send_scheduled_tasks():
-    levels_to_send = ["A1", "A2", "B1"]  # ← customize your levels
+    levels_to_send = ["A1", "A2", "B1", "B2"]
     sent_summary = []
+    # TODO: per-level task IDs or rotation (e.g. from a sheet)
+    example_task_ids = {"A1": 1, "A2": 1, "B1": 1, "B2": 1}
 
     for level in levels_to_send:
+        channel_id = LEVEL_CHANNELS.get(level)
+        if not channel_id:
+            continue
         students = get_students_by_level(level)
         if not students:
             continue
-
-        # TODO: Replace with real rotation logic later (e.g. from Tasks sheet)
-        example_task_id = 123  # ← CHANGE THIS! Use actual message ID or rotation
-
+        task_id = example_task_ids.get(level, 1)
         sent_count = 0
         for chat_id in students:
             try:
                 bot.forward_message(
                     chat_id=chat_id,
-                    from_chat_id=TASK_SOURCE_CHANNEL_ID,
-                    message_id=example_task_id,
-                    caption=f"📢 New task for {level.upper()} level! Listen and reply with voice."
+                    from_chat_id=channel_id,
+                    message_id=task_id,
                 )
                 sent_count += 1
             except Exception as e:
                 print(f"Failed to send to {chat_id}: {e}")
-
         sent_summary.append(f"{level}: {sent_count} students")
 
     if sent_summary:
-        bot.send_message(ADMIN_FEEDBACK_CHAT_ID, f"Scheduled tasks sent:\n" + "\n".join(sent_summary))
+        bot.send_message(ADMIN_FEEDBACK_CHAT_ID, "Scheduled tasks sent:\n" + "\n".join(sent_summary))
+        try:
+            bot.send_message(WORK_CHAT_ID, "Scheduled tasks sent:\n" + "\n".join(sent_summary))
+        except Exception:
+            pass
 
 # Schedule Mon, Wed, Fri
 schedule.every().monday.at("09:00").do(send_scheduled_tasks)
