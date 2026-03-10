@@ -272,6 +272,10 @@ def clear_registration_state(chat_id: int):
 # =======================
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 
+# Maps message IDs in admin DM → student chat_id so reply detection
+# works even when Telegram hides forward_from due to privacy settings.
+_student_reply_map: dict = {}
+
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
@@ -560,23 +564,26 @@ def handle_voice(message: types.Message):
 
     # 1) Admin replying with voice to a forwarded student message → send feedback to student
     if chat_id == ADMIN_FEEDBACK_CHAT_ID and message.reply_to_message:
+        replied_msg_id = message.reply_to_message.message_id
         fwd = getattr(message.reply_to_message, "forward_from", None)
-        if fwd:
+        student_id = fwd.id if fwd else _student_reply_map.get(replied_msg_id)
+        if student_id:
             try:
                 bot.send_voice(
-                    fwd.id,
+                    student_id,
                     message.voice.file_id,
                     caption="🎤 Personalized feedback from your teacher! Keep going!",
                 )
-                bot.reply_to(message, "Feedback sent to student!")
+                bot.reply_to(message, "✅ Voice feedback sent to student!")
             except Exception as e:
                 bot.reply_to(message, f"Failed to send: {e}")
             return
 
-    # 2) Admin test/practice: you (or partner) send a voice in your DM or work chat → transcribe + draft, send to both
-    is_admin_chat = chat_id in (ADMIN_FEEDBACK_CHAT_ID, WORK_CHAT_ID)
-    is_reply_to_student = message.reply_to_message and getattr(
-        message.reply_to_message, "forward_from", None
+    # 2) Admin test/practice: only when admin sends voice directly in their own bot DM (not work chat)
+    is_admin_chat = chat_id == ADMIN_FEEDBACK_CHAT_ID
+    is_reply_to_student = message.reply_to_message and (
+        getattr(message.reply_to_message, "forward_from", None)
+        or _student_reply_map.get(message.reply_to_message.message_id)
     )
     if is_admin_chat and from_id in ADMIN_IDS and not is_reply_to_student:
         level_label = "Practice (forwarded)" if (getattr(message, "forward_from", None) or getattr(message, "forward_date", None)) else "Test"
@@ -592,7 +599,7 @@ def handle_voice(message: types.Message):
                 f"🧪 {level_label} voice\n"
                 f"Transcript:\n{transcript}"
             )
-            feedback_msg = f"📋 AI Draft Feedback:\n\n{ai_draft}"
+            feedback_msg = ai_draft
             try:
                 bot.forward_message(ADMIN_FEEDBACK_CHAT_ID, chat_id, message.message_id)
             except Exception:
@@ -624,7 +631,10 @@ def handle_voice(message: types.Message):
                 pass
         return
 
-    # 3) Student voice → transcript message first, then AI feedback (using task script) in a separate message
+    # 3) Student voice → transcript, script status, then clean AI draft (each as separate messages)
+    if from_id in ADMIN_IDS:
+        return
+
     temp_path = None
     transcript = "[Transcription unavailable - set OPENAI_API_KEY]"
     level = "Unknown"
@@ -644,39 +654,43 @@ def handle_voice(message: types.Message):
 
         transcript, _ = _run_transcribe_and_draft(temp_path, level)
 
-        # Message 1: forward voice + transcript only (no feedback yet)
+        # Message 1: forward voice + transcript
         transcript_msg = (
-            f"🗣️ New voice reply to review\n"
-            f"Student Chat ID: <code>{chat_id}</code>\n"
-            f"Level: <b>{level}</b>\n\n"
+            f"🗣️ New voice reply\n"
+            f"Student Chat ID: <code>{chat_id}</code> | Level: <b>{level}</b>\n\n"
             f"Transcript:\n{transcript}\n\n"
-            f"Reply to the voice (in your bot DM) with your voice to send feedback to the student."
+            f"Reply to the forwarded voice below with your voice or text to send feedback to the student."
         )
         fwd_admin = bot.forward_message(ADMIN_FEEDBACK_CHAT_ID, chat_id, message.message_id)
-        bot.send_message(ADMIN_FEEDBACK_CHAT_ID, transcript_msg, reply_to_message_id=fwd_admin.message_id)
+        _student_reply_map[fwd_admin.message_id] = chat_id
+        transcript_sent = bot.send_message(ADMIN_FEEDBACK_CHAT_ID, transcript_msg, reply_to_message_id=fwd_admin.message_id)
+        _student_reply_map[transcript_sent.message_id] = chat_id
         try:
             bot.forward_message(WORK_CHAT_ID, chat_id, message.message_id)
             bot.send_message(WORK_CHAT_ID, transcript_msg)
         except Exception as e:
             print(f"Failed to send to work chat: {e}")
 
-        # Message 2: AI feedback based on task script (Task # = Total Tasks Sent from Students)
+        # Message 2: script status
         _, total_tasks_sent = get_student_level_and_total_tasks(chat_id)
         task_script = get_task_script(level, total_tasks_sent) if total_tasks_sent else ""
         print(f"[Voice] chat_id={chat_id} level={level} task#={total_tasks_sent} script_found={bool(task_script)}")
         script_status = (
             f"Task # used: <b>{total_tasks_sent}</b> | Script: {'✅ found' if task_script else '⚠️ not found (generic feedback used)'}"
         )
-        bot.send_message(ADMIN_FEEDBACK_CHAT_ID, script_status)
+        status_sent = bot.send_message(ADMIN_FEEDBACK_CHAT_ID, script_status)
+        _student_reply_map[status_sent.message_id] = chat_id
         try:
             bot.send_message(WORK_CHAT_ID, script_status)
         except Exception as e:
             print(f"Failed to send script status to work chat: {e}")
+
+        # Message 3: clean AI draft (no header — ready to forward or copy-paste to student)
         ai_draft = _run_draft_feedback(transcript, level, task_script)
-        feedback_msg = f"📋 AI feedback (based on task criteria):\n\n{ai_draft}"
-        bot.send_message(ADMIN_FEEDBACK_CHAT_ID, feedback_msg)
+        feedback_sent = bot.send_message(ADMIN_FEEDBACK_CHAT_ID, ai_draft)
+        _student_reply_map[feedback_sent.message_id] = chat_id
         try:
-            bot.send_message(WORK_CHAT_ID, feedback_msg)
+            bot.send_message(WORK_CHAT_ID, ai_draft)
         except Exception as e:
             print(f"Failed to send feedback to work chat: {e}")
     except Exception as e:
@@ -701,6 +715,31 @@ def handle_voice(message: types.Message):
             os.remove(temp_path)
         except OSError:
             pass
+
+# =======================
+# ADMIN TEXT REPLY → STUDENT
+# =======================
+@bot.message_handler(
+    func=lambda m: (
+        m.chat.id == ADMIN_FEEDBACK_CHAT_ID
+        and m.reply_to_message is not None
+        and _student_reply_map.get(m.reply_to_message.message_id) is not None
+        and m.from_user is not None
+        and m.from_user.id in ADMIN_IDS
+        and m.content_type == "text"
+    ),
+    content_types=["text"],
+)
+def handle_admin_text_reply(message: types.Message):
+    student_id = _student_reply_map.get(message.reply_to_message.message_id)
+    if not student_id:
+        return
+    try:
+        bot.send_message(student_id, message.text)
+        bot.reply_to(message, "✅ Text feedback sent to student!")
+    except Exception as e:
+        bot.reply_to(message, f"Failed to send: {e}")
+
 
 # =======================
 # SCHEDULING
