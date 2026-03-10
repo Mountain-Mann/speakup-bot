@@ -224,7 +224,7 @@ def get_task_script(level: str, task_number: int) -> str:
         try:
             num = int(row.get("Task #", 0) or 0)
             if num == task_number:
-                return (str(row.get("Script Text", row.get("Script text", "")) or "").strip()
+                return str(row.get("Script Text", row.get("Script text", "")) or "").strip()
         except (TypeError, ValueError):
             continue
     return ""
