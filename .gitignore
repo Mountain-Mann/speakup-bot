@@ -12,6 +12,7 @@ venv/
 
 # Bot temp files
 temp_reply.ogg
+registration_state.json
 
 # OS
 .DS_Store

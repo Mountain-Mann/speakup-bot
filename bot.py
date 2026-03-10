@@ -1,7 +1,8 @@
 import os
 import threading
 import time
-from typing import List
+from datetime import datetime
+from typing import List, Optional, Tuple
 import telebot
 from telebot import types
 import gspread
@@ -57,6 +58,12 @@ SPREADSHEET_NAME = "SpeakUp!"
 STUDENTS_SHEET_NAME = "Students"
 # Real "Students" tab columns A1–K1: Name, Telegram Handle, Chat ID, Telephone, Student ID, Level, Tier End Date, Tasks Sent This Week, Tasks Due Today, Balance Due, Notes
 STUDENTS_HEADERS = ["Name", "Telegram Handle", "Chat ID", "Telephone", "Student ID", "Level", "Tier End Date", "Tasks Sent This Week", "Tasks Due Today", "Balance Due", "Notes"]
+LEVELS = ["A1", "A2", "B1", "B2"]
+REGISTRATION_STATE_PATH = os.path.join(_BOT_DIR, "registration_state.json")
+# Task list tabs: "A2 Task List", "B2 Task List" (etc.) with columns "Task #", "Message ID" (channel), "Script Text"
+# Task Log tab: Date Sent, Student, Task #, Voice File Name, Reply Received, Week #, Level (Total Tasks Sent in Students is formula from this)
+TASK_LOG_SHEET_NAME = "Task Log"
+TASK_LOG_HEADERS = ["Date Sent", "Student", "Task #", "Voice File Name", "Reply Received", "Week #", "Level"]
 
 # On Railway/Heroku: no file on disk. Set env var GOOGLE_CREDENTIALS_JSON to the full JSON
 # content of your service account key; we write it to service_account.json at startup.
@@ -91,7 +98,13 @@ def get_students_worksheet():
         ws.append_row(STUDENTS_HEADERS)
     return ws
 
-def register_student(chat_id: int, level: str, name: str = "", telegram_handle: str = ""):
+def register_student(
+    chat_id: int,
+    level: str,
+    name: str = "",
+    telegram_handle: str = "",
+    telephone: str = "",
+):
     ws = get_students_worksheet()
     all_rows = ws.get_all_records()
     row_index_to_update = None
@@ -100,13 +113,16 @@ def register_student(chat_id: int, level: str, name: str = "", telegram_handle: 
             row_index_to_update = idx
             break
     if row_index_to_update:
-        ws.update_cell(row_index_to_update, 6, level)  # Level = column F
+        ws.update_cell(row_index_to_update, 6, level)   # Level = column F
+        if telephone:
+            ws.update_cell(row_index_to_update, 4, telephone)  # Telephone = column D
     else:
         ws.append_row([
             name or "",
             telegram_handle or "",
             str(chat_id),
-            "", "", level, "", "", "", "", "",
+            telephone or "",
+            "", level, "", "", "", "", "",
         ])
 
 def get_students_by_level(level: str) -> List[int]:
@@ -121,6 +137,136 @@ def get_students_by_level(level: str) -> List[int]:
                 continue
     return chat_ids
 
+
+def get_student_row(chat_id: int) -> Optional[dict]:
+    """Get the Students row for this chat_id, or None."""
+    ws = get_students_worksheet()
+    for row in ws.get_all_records():
+        if str(row.get("Chat ID")) == str(chat_id):
+            return row
+    return None
+
+
+def get_student_level_and_total_tasks(chat_id: int) -> Tuple[str, int]:
+    """Get (level, total_tasks_sent) from Students. Total Tasks Sent is from your formula (count in Task Log)."""
+    row = get_student_row(chat_id)
+    if not row:
+        return "Unknown", 0
+    level = str(row.get("Level", "Unknown") or "Unknown").strip()
+    try:
+        total = int(row.get("Total Tasks Sent") or row.get("Total tasks sent") or 0)
+    except (TypeError, ValueError):
+        total = 0
+    return level, total
+
+
+def get_student_name(chat_id: int) -> str:
+    """Get student name from Students sheet for Task Log."""
+    row = get_student_row(chat_id)
+    if not row:
+        return str(chat_id)
+    return str(row.get("Name", "") or row.get("Student", "") or chat_id).strip() or str(chat_id)
+
+
+def get_task_log_worksheet():
+    client = get_gspread_client()
+    spreadsheet = client.open(SPREADSHEET_NAME)
+    try:
+        ws = spreadsheet.worksheet(TASK_LOG_SHEET_NAME)
+    except gspread.WorksheetNotFound:
+        ws = spreadsheet.add_worksheet(title=TASK_LOG_SHEET_NAME, rows="2000", cols=len(TASK_LOG_HEADERS))
+        ws.append_row(TASK_LOG_HEADERS)
+    return ws
+
+
+def append_task_log(student_name: str, task_number: int, level: str, voice_file_name: str = ""):
+    """Append a row to Task Log so your Total Tasks Sent formula in Students updates."""
+    ws = get_task_log_worksheet()
+    now = datetime.utcnow()
+    date_sent = now.strftime("%Y-%m-%d %H:%M")
+    week_num = now.isocalendar()[1]
+    ws.append_row([date_sent, student_name, task_number, voice_file_name or "", "", week_num, level])
+
+
+def _get_task_list_worksheet(level: str):
+    """Open the level's Task List sheet (e.g. A2 Task List)."""
+    sheet_name = f"{level.strip().upper()} Task List"
+    try:
+        client = get_gspread_client()
+        spreadsheet = client.open(SPREADSHEET_NAME)
+        return spreadsheet.worksheet(sheet_name)
+    except gspread.WorksheetNotFound:
+        return None
+
+
+def get_channel_message_id_for_task(level: str, task_number: int) -> Optional[int]:
+    """Get the channel Message ID to forward for this Task # from the level's Task List (column 'Message ID')."""
+    ws = _get_task_list_worksheet(level)
+    if not ws:
+        return None
+    for row in ws.get_all_records():
+        try:
+            num = int(row.get("Task #", 0) or 0)
+            if num == task_number:
+                mid = row.get("Message ID") or row.get("Message id")
+                return int(mid) if mid not in (None, "") else None
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def get_task_script(level: str, task_number: int) -> str:
+    """Get the Script Text for this Task # from the level's Task List sheet (e.g. A2 Task List)."""
+    ws = _get_task_list_worksheet(level)
+    if not ws:
+        return ""
+    for row in ws.get_all_records():
+        try:
+            num = int(row.get("Task #", 0) or 0)
+            if num == task_number:
+                return (str(row.get("Script Text", row.get("Script text", "")) or "").strip()
+        except (TypeError, ValueError):
+            continue
+    return ""
+
+
+# =======================
+# REGISTRATION STATE (for step-by-step signup)
+# =======================
+def _load_registration_state() -> dict:
+    if not os.path.exists(REGISTRATION_STATE_PATH):
+        return {}
+    try:
+        import json
+        with open(REGISTRATION_STATE_PATH, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_registration_state(data: dict):
+    import json
+    with open(REGISTRATION_STATE_PATH, "w") as f:
+        json.dump(data, f, indent=0)
+
+
+def get_registration_state(chat_id: int) -> Optional[dict]:
+    data = _load_registration_state()
+    return data.get(str(chat_id))
+
+
+def set_registration_state(chat_id: int, state: dict):
+    data = _load_registration_state()
+    data[str(chat_id)] = state
+    _save_registration_state(data)
+
+
+def clear_registration_state(chat_id: int):
+    data = _load_registration_state()
+    data.pop(str(chat_id), None)
+    _save_registration_state(data)
+
+
 # =======================
 # TELEGRAM BOT SETUP
 # =======================
@@ -130,29 +276,91 @@ def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
 # =======================
-# COMMAND: /start
+# REGISTRATION FLOW: /start → level (buttons) → name → phone (optional, Skip button)
 # =======================
+def _level_keyboard():
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    for level in LEVELS:
+        markup.add(types.InlineKeyboardButton(level, callback_data=f"reg_level_{level}"))
+    return markup
+
+
 @bot.message_handler(commands=["start"])
 def handle_start(message: types.Message):
-    """
-    Usage: /start <level>
-    Example: /start A1
-    """
-    parts = message.text.strip().split(maxsplit=1)
-    if len(parts) < 2:
-        bot.reply_to(
-            message,
-            "Hi! Please register with your level.\n"
-            "Example: <code>/start A1</code>",
-        )
-        return
-    level = parts[1].strip()
-    register_student(message.chat.id, level)
+    chat_id = message.chat.id
+    clear_registration_state(chat_id)
     bot.reply_to(
         message,
-        f"You are registered with level: <b>{level}</b>.\n"
-        "You will receive tasks here.",
+        "👋 Welcome! Tap your <b>level</b> to get started:",
+        reply_markup=_level_keyboard(),
     )
+
+
+@bot.callback_query_handler(func=lambda c: c.data and c.data.startswith("reg_level_"))
+def handle_reg_level(callback: types.CallbackQuery):
+    level = callback.data.replace("reg_level_", "")
+    chat_id = callback.message.chat.id
+    set_registration_state(chat_id, {"step": "name", "level": level})
+    bot.answer_callback_query(callback.id)
+    bot.send_message(chat_id, "✅ Level <b>" + level + "</b> selected.\n\nWhat is your <b>full name</b>? (Type it in the chat.)")
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "reg_skip_phone")
+def handle_reg_skip_phone(callback: types.CallbackQuery):
+    chat_id = callback.message.chat.id
+    state = get_registration_state(chat_id)
+    if not state or state.get("step") != "phone":
+        bot.answer_callback_query(callback.id)
+        return
+    u = callback.from_user
+    handle = f"@{u.username}" if u and u.username else ""
+    bot.answer_callback_query(callback.id)
+    _finish_registration(chat_id, state, telephone="", telegram_handle=handle)
+    clear_registration_state(chat_id)
+
+
+def _finish_registration(chat_id: int, state: dict, telephone: str = "", telegram_handle: str = ""):
+    name = state.get("name", "")
+    level = state.get("level", "")
+    register_student(chat_id, level, name=name, telegram_handle=telegram_handle, telephone=telephone)
+    bot.send_message(
+        chat_id,
+        f"🎉 You're all set!\n\nLevel: <b>{level}</b>. You'll receive tasks here. Send /start to change your level later.",
+    )
+
+
+@bot.message_handler(func=lambda m: get_registration_state(m.chat.id) is not None)
+def handle_registration_step(message: types.Message):
+    chat_id = message.chat.id
+    state = get_registration_state(chat_id)
+    if not state:
+        return
+    step = state.get("step")
+    if message.content_type != "text":
+        bot.reply_to(message, "Please type your answer in the chat (no voice or photos).")
+        return
+    text = (message.text or "").strip()
+
+    if step == "name":
+        if not text:
+            bot.reply_to(message, "Please type your full name.")
+            return
+        state["name"] = text
+        state["step"] = "phone"
+        set_registration_state(chat_id, state)
+        skip_btn = types.InlineKeyboardMarkup().row(
+            types.InlineKeyboardButton("Skip", callback_data="reg_skip_phone")
+        )
+        bot.reply_to(message, "Thanks! What's your <b>phone number</b>? (Optional — tap Skip if you prefer not to share.)", reply_markup=skip_btn)
+        return
+
+    if step == "phone":
+        u = message.from_user
+        handle = f"@{u.username}" if u and u.username else ""
+        clear_registration_state(chat_id)
+        _finish_registration(chat_id, state, telephone=text, telegram_handle=handle)
+        return
+
 
 # =======================
 # COMMAND: /sendtask (admin only)
@@ -160,32 +368,24 @@ def handle_start(message: types.Message):
 @bot.message_handler(commands=["sendtask"])
 def handle_sendtask(message: types.Message):
     """
-    Usage (admin only):
-    /sendtask <level> <task_message_id>
+    Usage (admin only): /sendtask <level>
+    Sends each student in that level their *next* task (Total Tasks Sent + 1) and logs to Task Log.
     """
     if not is_admin(message.from_user.id):
         bot.reply_to(message, "You are not authorized to use this command.")
         return
     parts = message.text.strip().split()
-    if len(parts) != 3:
+    if len(parts) != 2:
         bot.reply_to(
             message,
-            "Usage: <code>/sendtask &lt;level&gt; &lt;task_message_id&gt;</code>\n"
-            "Example: <code>/sendtask A1 123</code>",
+            "Usage: <code>/sendtask &lt;level&gt;</code>\n"
+            "Example: <code>/sendtask A2</code> — sends each student their next task and logs to Task Log.",
         )
         return
     level = parts[1].strip().upper()
     channel_id = LEVEL_CHANNELS.get(level)
     if not channel_id:
-        bot.reply_to(
-            message,
-            f"Unknown level <b>{level}</b>. Use one of: A1, A2, B1, B2.",
-        )
-        return
-    try:
-        task_message_id = int(parts[2])
-    except ValueError:
-        bot.reply_to(message, "task_message_id must be an integer.")
+        bot.reply_to(message, f"Unknown level <b>{level}</b>. Use one of: A1, A2, B1, B2.")
         return
     students = get_students_by_level(level)
     if not students:
@@ -193,18 +393,26 @@ def handle_sendtask(message: types.Message):
         return
     sent_count = 0
     for student_chat_id in students:
+        _, total = get_student_level_and_total_tasks(student_chat_id)
+        next_task = total + 1
+        message_id = get_channel_message_id_for_task(level, next_task)
+        if message_id is None:
+            print(f"Sendtask: no Task # {next_task} in {level} Task List for chat {student_chat_id}, skipping.")
+            continue
         try:
             bot.forward_message(
                 chat_id=student_chat_id,
                 from_chat_id=channel_id,
-                message_id=task_message_id,
+                message_id=message_id,
             )
+            student_name = get_student_name(student_chat_id)
+            append_task_log(student_name, next_task, level)
             sent_count += 1
         except Exception as exc:
             print(f"Failed to forward to {student_chat_id}: {exc}")
     bot.reply_to(
         message,
-        f"Forwarded task <code>{task_message_id}</code> from {level} library to {sent_count} student(s).",
+        f"Sent next task to {sent_count} student(s) in <b>{level}</b>. Task Log updated.",
     )
 
 # =======================
@@ -213,19 +421,18 @@ def handle_sendtask(message: types.Message):
 @bot.message_handler(commands=["sendtaskto"])
 def handle_sendtask_to(message: types.Message):
     """
-    Usage (admin only):
-    /sendtaskto <level> <chat_id> <task_message_id>
-    Uses the task library channel for that level (A1, A2, B1, B2).
+    Usage (admin only): /sendtaskto <level> <chat_id>
+    Sends that student their *next* task (Total Tasks Sent + 1) and logs to Task Log.
     """
     if not is_admin(message.from_user.id):
         bot.reply_to(message, "You are not authorized to use this command.")
         return
     parts = message.text.strip().split()
-    if len(parts) != 4:
+    if len(parts) != 3:
         bot.reply_to(
             message,
-            "Usage: <code>/sendtaskto &lt;level&gt; &lt;chat_id&gt; &lt;task_message_id&gt;</code>\n"
-            "Example: <code>/sendtaskto A1 123456789 7</code>",
+            "Usage: <code>/sendtaskto &lt;level&gt; &lt;chat_id&gt;</code>\n"
+            "Example: <code>/sendtaskto A2 123456789</code> — sends that chat their next task.",
         )
         return
     level = parts[1].strip().upper()
@@ -235,22 +442,29 @@ def handle_sendtask_to(message: types.Message):
         return
     try:
         target_chat_id = int(parts[2])
-        task_message_id = int(parts[3])
     except ValueError:
-        bot.reply_to(message, "chat_id and task_message_id must be integers.")
+        bot.reply_to(message, "chat_id must be an integer.")
+        return
+    _, total = get_student_level_and_total_tasks(target_chat_id)
+    next_task = total + 1
+    message_id = get_channel_message_id_for_task(level, next_task)
+    if message_id is None:
+        bot.reply_to(message, f"Next Task # <b>{next_task}</b> not in {level} Task List or no Message ID.")
         return
     try:
         bot.forward_message(
             chat_id=target_chat_id,
             from_chat_id=channel_id,
-            message_id=task_message_id,
+            message_id=message_id,
         )
+        student_name = get_student_name(target_chat_id)
+        append_task_log(student_name, next_task, level)
     except Exception as exc:
         bot.reply_to(message, f"Failed to forward task: <code>{exc}</code>")
         return
     bot.reply_to(
         message,
-        f"Forwarded {level} task <code>{task_message_id}</code> to chat <code>{target_chat_id}</code>.",
+        f"Sent {level} Task # <code>{next_task}</code> to chat <code>{target_chat_id}</code>. Task Log updated.",
     )
 
 # =======================
@@ -296,6 +510,26 @@ Create short, encouraging feedback (60-100 words): positive comment, 1-2 improve
         except Exception as e:
             ai_draft = f"[GPT error: {e}]"
     return transcript, ai_draft
+
+
+def _run_draft_feedback(transcript: str, level: str, task_script: str) -> str:
+    """Generate AI feedback using the task script as criteria. Returns draft text."""
+    if not openai_client:
+        return "[AI feedback unavailable - set OPENAI_API_KEY]"
+    try:
+        criteria = f' Use this task script as the criteria for feedback:\n"""\n{task_script}\n"""' if task_script else ""
+        prompt = f"""You are an ESL teacher. Student level: {level}.
+Transcript of the student's spoken response: "{transcript}"
+Create short, encouraging feedback (60-100 words): start with something positive, give 1-2 specific improvements based on the task criteria, end with motivation. Friendly tone.{criteria}"""
+        response = openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=200,
+            temperature=0.7,
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        return f"[GPT error: {e}]"
 
 
 def _send_voice_result_to_chats(
@@ -387,10 +621,9 @@ def handle_voice(message: types.Message):
                 pass
         return
 
-    # 3) Student voice → process and forward to admin + work chat
+    # 3) Student voice → transcript message first, then AI feedback (using task script) in a separate message
     temp_path = None
     transcript = "[Transcription unavailable - set OPENAI_API_KEY]"
-    ai_draft = "[AI feedback unavailable - set OPENAI_API_KEY]"
     level = "Unknown"
     try:
         file_info = bot.get_file(message.voice.file_id)
@@ -406,16 +639,36 @@ def handle_voice(message: types.Message):
                 level = row.get("Level", "Unknown")
                 break
 
-        transcript, ai_draft = _run_transcribe_and_draft(temp_path, level)
-        info_text = (
+        transcript, _ = _run_transcribe_and_draft(temp_path, level)
+
+        # Message 1: forward voice + transcript only (no feedback yet)
+        transcript_msg = (
             f"🗣️ New voice reply to review\n"
             f"Student Chat ID: <code>{chat_id}</code>\n"
-            f"Level: <b>{level}</b>\n"
+            f"Level: <b>{level}</b>\n\n"
             f"Transcript:\n{transcript}\n\n"
-            f"AI Draft Feedback:\n{ai_draft}\n\n"
             f"Reply to the voice (in your bot DM) with your voice to send feedback to the student."
         )
-        _send_voice_result_to_chats(chat_id, message.message_id, info_text)
+        fwd_admin = bot.forward_message(ADMIN_FEEDBACK_CHAT_ID, chat_id, message.message_id)
+        bot.send_message(ADMIN_FEEDBACK_CHAT_ID, transcript_msg, reply_to_message_id=fwd_admin.message_id)
+        try:
+            bot.forward_message(WORK_CHAT_ID, chat_id, message.message_id)
+            bot.send_message(WORK_CHAT_ID, transcript_msg)
+        except Exception as e:
+            print(f"Failed to send to work chat: {e}")
+
+        # Message 2: AI feedback based on task script (Task # = Total Tasks Sent from Students)
+        _, total_tasks_sent = get_student_level_and_total_tasks(chat_id)
+        task_script = get_task_script(level, total_tasks_sent) if total_tasks_sent else ""
+        ai_draft = _run_draft_feedback(transcript, level, task_script)
+        feedback_msg = (
+            f"📋 AI feedback (based on task criteria):\n\n{ai_draft}"
+        )
+        bot.send_message(ADMIN_FEEDBACK_CHAT_ID, feedback_msg)
+        try:
+            bot.send_message(WORK_CHAT_ID, feedback_msg)
+        except Exception as e:
+            print(f"Failed to send feedback to work chat: {e}")
     except Exception as e:
         print(f"Voice processing error: {e}")
         import traceback
@@ -443,10 +696,9 @@ def handle_voice(message: types.Message):
 # SCHEDULING
 # =======================
 def send_scheduled_tasks():
+    """Send each student their *next* task (Total Tasks Sent + 1) and append to Task Log."""
     levels_to_send = ["A1", "A2", "B1", "B2"]
     sent_summary = []
-    # TODO: per-level task IDs or rotation (e.g. from a sheet)
-    example_task_ids = {"A1": 1, "A2": 1, "B1": 1, "B2": 1}
 
     for level in levels_to_send:
         channel_id = LEVEL_CHANNELS.get(level)
@@ -455,15 +707,22 @@ def send_scheduled_tasks():
         students = get_students_by_level(level)
         if not students:
             continue
-        task_id = example_task_ids.get(level, 1)
         sent_count = 0
         for chat_id in students:
+            _, total = get_student_level_and_total_tasks(chat_id)
+            next_task = total + 1
+            message_id = get_channel_message_id_for_task(level, next_task)
+            if message_id is None:
+                print(f"Scheduled: no Task # {next_task} in {level} Task List for chat {chat_id}, skipping.")
+                continue
             try:
                 bot.forward_message(
                     chat_id=chat_id,
                     from_chat_id=channel_id,
-                    message_id=task_id,
+                    message_id=message_id,
                 )
+                student_name = get_student_name(chat_id)
+                append_task_log(student_name, next_task, level)
                 sent_count += 1
             except Exception as e:
                 print(f"Failed to send to {chat_id}: {e}")
