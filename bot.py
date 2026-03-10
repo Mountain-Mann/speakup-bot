@@ -660,10 +660,17 @@ def handle_voice(message: types.Message):
         # Message 2: AI feedback based on task script (Task # = Total Tasks Sent from Students)
         _, total_tasks_sent = get_student_level_and_total_tasks(chat_id)
         task_script = get_task_script(level, total_tasks_sent) if total_tasks_sent else ""
-        ai_draft = _run_draft_feedback(transcript, level, task_script)
-        feedback_msg = (
-            f"📋 AI feedback (based on task criteria):\n\n{ai_draft}"
+        print(f"[Voice] chat_id={chat_id} level={level} task#={total_tasks_sent} script_found={bool(task_script)}")
+        script_status = (
+            f"Task # used: <b>{total_tasks_sent}</b> | Script: {'✅ found' if task_script else '⚠️ not found (generic feedback used)'}"
         )
+        bot.send_message(ADMIN_FEEDBACK_CHAT_ID, script_status)
+        try:
+            bot.send_message(WORK_CHAT_ID, script_status)
+        except Exception as e:
+            print(f"Failed to send script status to work chat: {e}")
+        ai_draft = _run_draft_feedback(transcript, level, task_script)
+        feedback_msg = f"📋 AI feedback (based on task criteria):\n\n{ai_draft}"
         bot.send_message(ADMIN_FEEDBACK_CHAT_ID, feedback_msg)
         try:
             bot.send_message(WORK_CHAT_ID, feedback_msg)
