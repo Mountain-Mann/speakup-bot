@@ -588,26 +588,29 @@ def handle_voice(message: types.Message):
             with open(temp_path, "wb") as f:
                 f.write(downloaded_file)
             transcript, ai_draft = _run_transcribe_and_draft(temp_path, level_label)
-            info_text = (
+            transcript_msg = (
                 f"🧪 {level_label} voice\n"
-                f"Transcript:\n{transcript}\n\n"
-                f"AI Draft Feedback:\n{ai_draft}"
+                f"Transcript:\n{transcript}"
             )
+            feedback_msg = f"📋 AI Draft Feedback:\n\n{ai_draft}"
             try:
                 bot.forward_message(ADMIN_FEEDBACK_CHAT_ID, chat_id, message.message_id)
             except Exception:
                 pass
-            bot.send_message(ADMIN_FEEDBACK_CHAT_ID, info_text)
+            bot.send_message(ADMIN_FEEDBACK_CHAT_ID, transcript_msg)
+            bot.send_message(ADMIN_FEEDBACK_CHAT_ID, feedback_msg)
             # Partner gets a copy in their DM
             try:
                 bot.forward_message(PARTNER_CHAT_ID, chat_id, message.message_id)
-                bot.send_message(PARTNER_CHAT_ID, info_text)
+                bot.send_message(PARTNER_CHAT_ID, transcript_msg)
+                bot.send_message(PARTNER_CHAT_ID, feedback_msg)
             except Exception as e:
                 print(f"Could not send practice result to partner: {e}")
             # Work chat (bot must be added to the group)
             try:
                 bot.forward_message(WORK_CHAT_ID, chat_id, message.message_id)
-                bot.send_message(WORK_CHAT_ID, info_text)
+                bot.send_message(WORK_CHAT_ID, transcript_msg)
+                bot.send_message(WORK_CHAT_ID, feedback_msg)
             except Exception as e:
                 print(f"Could not send to work chat (is the bot in the group?): {e}")
                 bot.send_message(ADMIN_FEEDBACK_CHAT_ID, "⚠️ Couldn't post to work chat. Add the bot to the group if you haven't.")
