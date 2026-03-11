@@ -798,10 +798,10 @@ def send_scheduled_tasks():
         except Exception:
             pass
 
-# Schedule Mon, Wed, Fri at 09:00 UTC = 12:00 Moscow (UTC+3)
-schedule.every().monday.at("09:00").do(send_scheduled_tasks)
-schedule.every().wednesday.at("09:00").do(send_scheduled_tasks)
-schedule.every().friday.at("09:00").do(send_scheduled_tasks)
+# Schedule Mon, Wed, Fri at 06:00 UTC = 09:00 Moscow (UTC+3)
+schedule.every().monday.at("06:00").do(send_scheduled_tasks)
+schedule.every().wednesday.at("06:00").do(send_scheduled_tasks)
+schedule.every().friday.at("06:00").do(send_scheduled_tasks)
 
 def run_scheduler():
     while True:
