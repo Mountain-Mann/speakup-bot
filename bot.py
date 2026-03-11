@@ -1,7 +1,7 @@
 import os
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional, Tuple
 import telebot
 from telebot import types
@@ -179,10 +179,15 @@ def get_task_log_worksheet():
     return ws
 
 
+MOSCOW_TZ = timezone(timedelta(hours=3))
+
+def _now_moscow() -> datetime:
+    return datetime.now(MOSCOW_TZ)
+
 def append_task_log(student_name: str, task_number: int, level: str, voice_file_name: str = ""):
     """Append a row to Task Log so your Total Tasks Sent formula in Students updates."""
     ws = get_task_log_worksheet()
-    now = datetime.utcnow()
+    now = _now_moscow()
     date_sent = now.strftime("%Y-%m-%d %H:%M")
     week_num = now.isocalendar()[1]
     ws.append_row([date_sent, student_name, task_number, voice_file_name or "", "", week_num, level])
@@ -409,6 +414,9 @@ def handle_sendtask(message: types.Message):
                 from_chat_id=channel_id,
                 message_id=message_id,
             )
+            script_text = get_task_script(level, next_task)
+            if script_text:
+                bot.send_message(student_chat_id, script_text)
             student_name = get_student_name(student_chat_id)
             append_task_log(student_name, next_task, level)
             sent_count += 1
@@ -461,6 +469,9 @@ def handle_sendtask_to(message: types.Message):
             from_chat_id=channel_id,
             message_id=message_id,
         )
+        script_text = get_task_script(level, next_task)
+        if script_text:
+            bot.send_message(target_chat_id, script_text)
         student_name = get_student_name(target_chat_id)
         append_task_log(student_name, next_task, level)
     except Exception as exc:
@@ -770,6 +781,9 @@ def send_scheduled_tasks():
                     from_chat_id=channel_id,
                     message_id=message_id,
                 )
+                script_text = get_task_script(level, next_task)
+                if script_text:
+                    bot.send_message(chat_id, script_text)
                 student_name = get_student_name(chat_id)
                 append_task_log(student_name, next_task, level)
                 sent_count += 1
@@ -784,7 +798,7 @@ def send_scheduled_tasks():
         except Exception:
             pass
 
-# Schedule Mon, Wed, Fri
+# Schedule Mon, Wed, Fri at 09:00 UTC = 12:00 Moscow (UTC+3)
 schedule.every().monday.at("09:00").do(send_scheduled_tasks)
 schedule.every().wednesday.at("09:00").do(send_scheduled_tasks)
 schedule.every().friday.at("09:00").do(send_scheduled_tasks)
