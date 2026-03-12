@@ -233,13 +233,11 @@ def update_task_log_reply(chat_id: int, transcript: str, scores: dict):
         return
 
     now = _now_moscow().strftime("%Y-%m-%d %H:%M")
-    max_col = max(reply_col, transcript_col, pron_col, gram_col, vocab_col, fluency_col)
 
-    # Build an update batch so we only make one API call
+    # Pronunciation is left blank — filled in manually by the teacher after listening
     updates = [
         {"range": gspread.utils.rowcol_to_a1(target_row_idx, reply_col + 1), "values": [[now]]},
         {"range": gspread.utils.rowcol_to_a1(target_row_idx, transcript_col + 1), "values": [[transcript]]},
-        {"range": gspread.utils.rowcol_to_a1(target_row_idx, pron_col + 1), "values": [[scores.get("pronunciation", "")]]},
         {"range": gspread.utils.rowcol_to_a1(target_row_idx, gram_col + 1), "values": [[scores.get("grammar", "")]]},
         {"range": gspread.utils.rowcol_to_a1(target_row_idx, vocab_col + 1), "values": [[scores.get("vocabulary", "")]]},
         {"range": gspread.utils.rowcol_to_a1(target_row_idx, fluency_col + 1), "values": [[scores.get("fluency", "")]]},
@@ -817,10 +815,11 @@ def _run_draft_feedback_and_score(transcript: str, level: str, task_script: str)
     """Generate AI feedback + skill scores using the task script as criteria.
 
     Returns (feedback_text, scores) where scores is a dict with keys:
-    pronunciation, grammar, vocabulary, fluency (each 1-5 int).
+    grammar, vocabulary, fluency (each 1-5 int).
+    Pronunciation is intentionally omitted — filled in manually by the teacher.
     Falls back gracefully if JSON parsing fails.
     """
-    _empty_scores = {"pronunciation": 0, "grammar": 0, "vocabulary": 0, "fluency": 0}
+    _empty_scores = {"grammar": 0, "vocabulary": 0, "fluency": 0}
     if not openai_client:
         return "[AI feedback unavailable - set OPENAI_API_KEY]", _empty_scores
     try:
@@ -832,7 +831,6 @@ Transcript of the student's spoken response: "{transcript}"
 Respond ONLY with a valid JSON object (no markdown, no extra text) in this exact format:
 {{
   "feedback": "<60-100 word encouraging feedback: something positive, 1-2 specific improvements, motivating close>",
-  "pronunciation": <1-5>,
   "grammar": <1-5>,
   "vocabulary": <1-5>,
   "fluency": <1-5>
@@ -849,7 +847,6 @@ Scores: 1=needs a lot of work, 3=acceptable, 5=excellent."""
         data = _json.loads(raw)
         feedback = str(data.get("feedback", "")).strip() or raw
         scores = {
-            "pronunciation": int(data.get("pronunciation") or 0),
             "grammar": int(data.get("grammar") or 0),
             "vocabulary": int(data.get("vocabulary") or 0),
             "fluency": int(data.get("fluency") or 0),
