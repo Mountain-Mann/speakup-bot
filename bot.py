@@ -63,7 +63,10 @@ REGISTRATION_STATE_PATH = os.path.join(_BOT_DIR, "registration_state.json")
 # Task list tabs: "A2 Task List", "B2 Task List" (etc.) with columns "Task #", "Message ID" (channel), "Script Text"
 # Task Log tab: Date Sent, Student, Task #, Voice File Name, Reply Received, Week #, Level (Total Tasks Sent in Students is formula from this)
 TASK_LOG_SHEET_NAME = "Task Log"
-TASK_LOG_HEADERS = ["Date Sent", "Student", "Task #", "Voice File Name", "Reply Received", "Week #", "Level"]
+TASK_LOG_HEADERS = [
+    "Date Sent", "Student", "Task #", "Voice File Name", "Reply Received", "Week #", "Level",
+    "Chat ID", "Transcript", "Pronunciation", "Grammar", "Vocabulary", "Fluency",
+]
 
 # On Railway/Heroku: no file on disk. Set env var GOOGLE_CREDENTIALS_JSON to the full JSON
 # content of your service account key; we write it to service_account.json at startup.
@@ -184,13 +187,283 @@ MOSCOW_TZ = timezone(timedelta(hours=3))
 def _now_moscow() -> datetime:
     return datetime.now(MOSCOW_TZ)
 
-def append_task_log(student_name: str, task_number: int, level: str, voice_file_name: str = ""):
+def append_task_log(student_name: str, task_number: int, level: str, voice_file_name: str = "", chat_id: int = 0):
     """Append a row to Task Log so your Total Tasks Sent formula in Students updates."""
     ws = get_task_log_worksheet()
     now = _now_moscow()
     date_sent = now.strftime("%Y-%m-%d %H:%M")
     week_num = now.isocalendar()[1]
-    ws.append_row([date_sent, student_name, task_number, voice_file_name or "", "", week_num, level])
+    ws.append_row([
+        date_sent, student_name, task_number, voice_file_name or "", "", week_num, level,
+        str(chat_id) if chat_id else "", "", "", "", "", "",
+    ])
+
+
+def update_task_log_reply(chat_id: int, transcript: str, scores: dict):
+    """Find the most recent Task Log row for this chat_id with no Reply Received and fill it in."""
+    ws = get_task_log_worksheet()
+    all_values = ws.get_all_values()
+    if not all_values:
+        return
+    headers = all_values[0]
+    try:
+        chat_id_col = headers.index("Chat ID")
+        reply_col = headers.index("Reply Received")
+        transcript_col = headers.index("Transcript")
+        pron_col = headers.index("Pronunciation")
+        gram_col = headers.index("Grammar")
+        vocab_col = headers.index("Vocabulary")
+        fluency_col = headers.index("Fluency")
+    except ValueError:
+        print("update_task_log_reply: required column not found in Task Log headers")
+        return
+
+    # Walk rows in reverse to find the most recent unanswered row for this student
+    target_row_idx = None
+    for i in range(len(all_values) - 1, 0, -1):
+        row = all_values[i]
+        row_chat_id = row[chat_id_col] if chat_id_col < len(row) else ""
+        row_reply = row[reply_col] if reply_col < len(row) else ""
+        if str(row_chat_id).strip() == str(chat_id) and not str(row_reply).strip():
+            target_row_idx = i + 1  # gspread rows are 1-indexed
+            break
+
+    if target_row_idx is None:
+        print(f"update_task_log_reply: no open row found for chat_id={chat_id}")
+        return
+
+    now = _now_moscow().strftime("%Y-%m-%d %H:%M")
+    max_col = max(reply_col, transcript_col, pron_col, gram_col, vocab_col, fluency_col)
+
+    # Build an update batch so we only make one API call
+    updates = [
+        {"range": gspread.utils.rowcol_to_a1(target_row_idx, reply_col + 1), "values": [[now]]},
+        {"range": gspread.utils.rowcol_to_a1(target_row_idx, transcript_col + 1), "values": [[transcript]]},
+        {"range": gspread.utils.rowcol_to_a1(target_row_idx, pron_col + 1), "values": [[scores.get("pronunciation", "")]]},
+        {"range": gspread.utils.rowcol_to_a1(target_row_idx, gram_col + 1), "values": [[scores.get("grammar", "")]]},
+        {"range": gspread.utils.rowcol_to_a1(target_row_idx, vocab_col + 1), "values": [[scores.get("vocabulary", "")]]},
+        {"range": gspread.utils.rowcol_to_a1(target_row_idx, fluency_col + 1), "values": [[scores.get("fluency", "")]]},
+    ]
+    try:
+        ws.batch_update(updates)
+    except Exception as e:
+        print(f"update_task_log_reply batch_update error: {e}")
+
+
+def get_student_task_log(chat_id: int) -> List[dict]:
+    """Return all Task Log rows for this chat_id as a list of dicts."""
+    ws = get_task_log_worksheet()
+    all_values = ws.get_all_values()
+    if not all_values:
+        return []
+    headers = all_values[0]
+    rows = []
+    try:
+        chat_id_col = headers.index("Chat ID")
+    except ValueError:
+        return []
+    for row in all_values[1:]:
+        if chat_id_col < len(row) and str(row[chat_id_col]).strip() == str(chat_id):
+            rows.append(dict(zip(headers, row)))
+    return rows
+
+
+def _def_scores(rows: List[dict], key: str) -> List[float]:
+    """Extract non-zero numeric scores from task log rows for a given skill key."""
+    out = []
+    for r in rows:
+        try:
+            v = int(r.get(key) or 0)
+            if v > 0:
+                out.append(float(v))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _week_streak(rows: List[dict]) -> int:
+    """Count how many consecutive ISO weeks (ending with this week) the student replied in."""
+    replied_weeks = set()
+    for r in rows:
+        if r.get("Reply Received"):
+            try:
+                dt = datetime.strptime(r["Reply Received"][:16], "%Y-%m-%d %H:%M")
+                replied_weeks.add(dt.isocalendar()[:2])  # (year, week)
+            except (ValueError, KeyError):
+                continue
+    if not replied_weeks:
+        return 0
+    now = _now_moscow()
+    streak = 0
+    year, week, _ = now.isocalendar()
+    while (year, week) in replied_weeks:
+        streak += 1
+        # step back one ISO week
+        prev = datetime.fromisocalendar(year, week, 1) - timedelta(weeks=1)
+        year, week, _ = prev.isocalendar()
+    return streak
+
+
+def _def_score_bar(value: float, max_val: int = 5) -> str:
+    """Turn a 1-5 score into a compact filled/empty bar string."""
+    filled = round(value)
+    return "█" * filled + "░" * (max_val - filled)
+
+
+def _def_skill_label(avg: float) -> str:
+    if avg == 0:
+        return "no data yet"
+    if avg >= 4.5:
+        return "excellent"
+    if avg >= 3.5:
+        return "good"
+    if avg >= 2.5:
+        return "developing"
+    return "needs focus"
+
+
+def _def_format_progress(chat_id: int) -> str:
+    """Build the full /progress message for a student."""
+    rows = get_student_task_log(chat_id)
+    if not rows:
+        return "No task history found yet. Complete your first task to start tracking progress!"
+
+    total_sent = len(rows)
+    replied_rows = [r for r in rows if r.get("Reply Received")]
+    total_replied = len(replied_rows)
+    reply_rate = round(total_replied / total_sent * 100) if total_sent else 0
+    streak = _week_streak(rows)
+
+    level, _ = get_student_level_and_total_tasks(chat_id)
+
+    # Use last 10 replied rows for skill averages
+    last_10 = replied_rows[-10:]
+    skills = ["Pronunciation", "Grammar", "Vocabulary", "Fluency"]
+    averages = {}
+    for skill in skills:
+        vals = _def_scores(last_10, skill)
+        averages[skill] = round(sum(vals) / len(vals), 1) if vals else 0.0
+
+    scored_skills = {k: v for k, v in averages.items() if v > 0}
+    weakest = min(scored_skills, key=scored_skills.get) if scored_skills else None
+
+    streak_str = f"🔥 {streak} week{'s' if streak != 1 else ''} in a row" if streak >= 2 else ("✅ Active this week" if streak == 1 else "No streak yet — reply this week to start one!")
+
+    lines = [
+        "<b>Your SpeakUp Progress</b>",
+        "",
+        f"Level: <b>{level}</b>  |  Tasks sent: <b>{total_sent}</b>",
+        f"Replied: <b>{total_replied}</b> of {total_sent} ({reply_rate}%)",
+        f"Streak: {streak_str}",
+    ]
+
+    if scored_skills:
+        lines += ["", "<b>Skill averages (last 10 tasks):</b>"]
+        for skill in skills:
+            avg = averages[skill]
+            if avg > 0:
+                bar = _def_score_bar(avg)
+                label = _def_skill_label(avg)
+                lines.append(f"  {skill}: {bar} {avg}/5 — {label}")
+
+    if weakest:
+        lines += ["", f"Focus area: <b>{weakest}</b> — keep practising, you're making progress!"]
+
+    return "\n".join(lines)
+
+
+def _def_format_monthly_summary(chat_id: int, month_rows: List[dict], prev_rows: List[dict]) -> str:
+    """Build a monthly progress summary for a student."""
+    total = len(month_rows)
+    replied = [r for r in month_rows if r.get("Reply Received")]
+    rate = round(len(replied) / total * 100) if total else 0
+    level, _ = get_student_level_and_total_tasks(chat_id)
+
+    skills = ["Pronunciation", "Grammar", "Vocabulary", "Fluency"]
+    curr_avgs = {}
+    prev_avgs = {}
+    for skill in skills:
+        curr_vals = _def_scores(replied, skill)
+        curr_avgs[skill] = round(sum(curr_vals) / len(curr_vals), 1) if curr_vals else 0.0
+        prev_vals = _def_scores([r for r in prev_rows if r.get("Reply Received")], skill)
+        prev_avgs[skill] = round(sum(prev_vals) / len(prev_vals), 1) if prev_vals else 0.0
+
+    now = _now_moscow()
+    prev_month_dt = (now.replace(day=1) - timedelta(days=1))
+    month_name = prev_month_dt.strftime("%B")
+
+    lines = [
+        f"<b>Your {month_name} Progress Report</b>",
+        "",
+        f"Level: <b>{level}</b>",
+        f"Tasks this month: <b>{total}</b> sent, <b>{len(replied)}</b> completed ({rate}%)",
+        "",
+        "<b>Skill scores:</b>",
+    ]
+    for skill in skills:
+        avg = curr_avgs[skill]
+        if avg > 0:
+            trend = ""
+            if prev_avgs[skill] > 0:
+                diff = round(avg - prev_avgs[skill], 1)
+                if diff > 0:
+                    trend = f" (+{diff} vs last month)"
+                elif diff < 0:
+                    trend = f" ({diff} vs last month)"
+            bar = _def_score_bar(avg)
+            lines.append(f"  {skill}: {bar} {avg}/5{trend}")
+
+    scored = {k: v for k, v in curr_avgs.items() if v > 0}
+    if scored:
+        best = max(scored, key=scored.get)
+        worst = min(scored, key=scored.get)
+        lines += [
+            "",
+            f"Biggest strength this month: <b>{best}</b>",
+            f"Keep working on: <b>{worst}</b>",
+        ]
+
+    lines += ["", "Great work — see you next month! 💪"]
+    return "\n".join(lines)
+
+
+def _get_month_task_rows(chat_id: int, year: int, month: int) -> List[dict]:
+    """Return Task Log rows for a given student and calendar month."""
+    rows = get_student_task_log(chat_id)
+    result = []
+    for r in rows:
+        try:
+            dt = datetime.strptime(r.get("Date Sent", "")[:7], "%Y-%m")
+            if dt.year == year and dt.month == month:
+                result.append(r)
+        except (ValueError, KeyError):
+            continue
+    return result
+
+
+def _def_all_student_chat_ids() -> List[int]:
+    """Return all chat IDs from the Students sheet (for bulk messaging)."""
+    ws = get_students_worksheet()
+    chat_ids = []
+    for row in ws.get_all_records():
+        try:
+            chat_ids.append(int(row.get("Chat ID")))
+        except (TypeError, ValueError):
+            continue
+    return chat_ids
+
+
+def _def_get_all_levels() -> dict:
+    """Return {chat_id: level} for all students."""
+    ws = get_students_worksheet()
+    result = {}
+    for row in ws.get_all_records():
+        try:
+            cid = int(row.get("Chat ID"))
+            result[cid] = str(row.get("Level", "")).strip()
+        except (TypeError, ValueError):
+            continue
+    return result
 
 
 def _get_task_list_worksheet(level: str):
@@ -418,7 +691,7 @@ def handle_sendtask(message: types.Message):
             if script_text:
                 bot.send_message(student_chat_id, script_text)
             student_name = get_student_name(student_chat_id)
-            append_task_log(student_name, next_task, level)
+            append_task_log(student_name, next_task, level, chat_id=student_chat_id)
             sent_count += 1
         except Exception as exc:
             print(f"Failed to forward to {student_chat_id}: {exc}")
@@ -473,7 +746,7 @@ def handle_sendtask_to(message: types.Message):
         if script_text:
             bot.send_message(target_chat_id, script_text)
         student_name = get_student_name(target_chat_id)
-        append_task_log(student_name, next_task, level)
+        append_task_log(student_name, next_task, level, chat_id=target_chat_id)
     except Exception as exc:
         bot.reply_to(message, f"Failed to forward task: <code>{exc}</code>")
         return
@@ -481,6 +754,19 @@ def handle_sendtask_to(message: types.Message):
         message,
         f"Sent {level} Task # <code>{next_task}</code> to chat <code>{target_chat_id}</code>. Task Log updated.",
     )
+
+# =======================
+# COMMAND: /progress (student-facing)
+# =======================
+@bot.message_handler(commands=["progress"])
+def handle_progress(message: types.Message):
+    chat_id = message.chat.id
+    try:
+        text = _def_format_progress(chat_id)
+    except Exception as e:
+        text = f"Could not load your progress right now. Please try again later. ({e})"
+    bot.send_message(chat_id, text)
+
 
 # =======================
 # VOICE HANDLER (with AI transcription + draft)
@@ -527,24 +813,50 @@ Create short, encouraging feedback (60-100 words): positive comment, 1-2 improve
     return transcript, ai_draft
 
 
-def _run_draft_feedback(transcript: str, level: str, task_script: str) -> str:
-    """Generate AI feedback using the task script as criteria. Returns draft text."""
+def _run_draft_feedback_and_score(transcript: str, level: str, task_script: str) -> Tuple[str, dict]:
+    """Generate AI feedback + skill scores using the task script as criteria.
+
+    Returns (feedback_text, scores) where scores is a dict with keys:
+    pronunciation, grammar, vocabulary, fluency (each 1-5 int).
+    Falls back gracefully if JSON parsing fails.
+    """
+    _empty_scores = {"pronunciation": 0, "grammar": 0, "vocabulary": 0, "fluency": 0}
     if not openai_client:
-        return "[AI feedback unavailable - set OPENAI_API_KEY]"
+        return "[AI feedback unavailable - set OPENAI_API_KEY]", _empty_scores
     try:
-        criteria = f' Use this task script as the criteria for feedback:\n"""\n{task_script}\n"""' if task_script else ""
+        import json as _json
+        criteria = f'\nUse this task script as the criteria for feedback:\n"""\n{task_script}\n"""' if task_script else ""
         prompt = f"""You are an ESL teacher. Student level: {level}.
 Transcript of the student's spoken response: "{transcript}"
-Create short, encouraging feedback (60-100 words): start with something positive, give 1-2 specific improvements based on the task criteria, end with motivation. Friendly tone.{criteria}"""
+{criteria}
+Respond ONLY with a valid JSON object (no markdown, no extra text) in this exact format:
+{{
+  "feedback": "<60-100 word encouraging feedback: something positive, 1-2 specific improvements, motivating close>",
+  "pronunciation": <1-5>,
+  "grammar": <1-5>,
+  "vocabulary": <1-5>,
+  "fluency": <1-5>
+}}
+Scores: 1=needs a lot of work, 3=acceptable, 5=excellent."""
         response = openai_client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=200,
+            max_tokens=300,
             temperature=0.7,
+            response_format={"type": "json_object"},
         )
-        return response.choices[0].message.content.strip()
+        raw = response.choices[0].message.content.strip()
+        data = _json.loads(raw)
+        feedback = str(data.get("feedback", "")).strip() or raw
+        scores = {
+            "pronunciation": int(data.get("pronunciation") or 0),
+            "grammar": int(data.get("grammar") or 0),
+            "vocabulary": int(data.get("vocabulary") or 0),
+            "fluency": int(data.get("fluency") or 0),
+        }
+        return feedback, scores
     except Exception as e:
-        return f"[GPT error: {e}]"
+        return f"[GPT error: {e}]", _empty_scores
 
 
 def _send_voice_result_to_chats(
@@ -697,13 +1009,19 @@ def handle_voice(message: types.Message):
             print(f"Failed to send script status to work chat: {e}")
 
         # Message 3: clean AI draft (no header — ready to forward or copy-paste to student)
-        ai_draft = _run_draft_feedback(transcript, level, task_script)
+        ai_draft, scores = _run_draft_feedback_and_score(transcript, level, task_script)
         feedback_sent = bot.send_message(ADMIN_FEEDBACK_CHAT_ID, ai_draft)
         _student_reply_map[feedback_sent.message_id] = chat_id
         try:
             bot.send_message(WORK_CHAT_ID, ai_draft)
         except Exception as e:
             print(f"Failed to send feedback to work chat: {e}")
+
+        # Log the reply + scores back to Task Log
+        try:
+            update_task_log_reply(chat_id, transcript, scores)
+        except Exception as e:
+            print(f"Failed to update task log reply: {e}")
     except Exception as e:
         print(f"Voice processing error: {e}")
         import traceback
@@ -785,7 +1103,7 @@ def send_scheduled_tasks():
                 if script_text:
                     bot.send_message(chat_id, script_text)
                 student_name = get_student_name(chat_id)
-                append_task_log(student_name, next_task, level)
+                append_task_log(student_name, next_task, level, chat_id=chat_id)
                 sent_count += 1
             except Exception as e:
                 print(f"Failed to send to {chat_id}: {e}")
@@ -798,10 +1116,46 @@ def send_scheduled_tasks():
         except Exception:
             pass
 
+def send_monthly_progress_summaries():
+    """On the 1st of each month, send every student their previous month's progress summary."""
+    now = _now_moscow()
+    if now.day != 1:
+        return
+    prev = now.replace(day=1) - timedelta(days=1)
+    prev_year, prev_month = prev.year, prev.month
+    # Month before that (for trend comparison)
+    prev2 = prev.replace(day=1) - timedelta(days=1)
+    prev2_year, prev2_month = prev2.year, prev2.month
+
+    student_ids = _def_all_student_chat_ids()
+    sent = 0
+    for chat_id in student_ids:
+        month_rows = _get_month_task_rows(chat_id, prev_year, prev_month)
+        if not month_rows:
+            continue
+        prev2_rows = _get_month_task_rows(chat_id, prev2_year, prev2_month)
+        try:
+            text = _def_format_monthly_summary(chat_id, month_rows, prev2_rows)
+            bot.send_message(chat_id, text)
+            sent += 1
+        except Exception as e:
+            print(f"Monthly summary failed for {chat_id}: {e}")
+
+    summary = f"Monthly progress summaries sent to {sent} student(s)."
+    print(summary)
+    try:
+        bot.send_message(ADMIN_FEEDBACK_CHAT_ID, summary)
+    except Exception:
+        pass
+
+
 # Schedule Mon, Wed, Fri at 06:00 UTC = 09:00 Moscow (UTC+3)
 schedule.every().monday.at("06:00").do(send_scheduled_tasks)
 schedule.every().wednesday.at("06:00").do(send_scheduled_tasks)
 schedule.every().friday.at("06:00").do(send_scheduled_tasks)
+
+# Monthly progress summaries on the 1st at 06:00 UTC = 09:00 Moscow
+schedule.every().day.at("06:00").do(send_monthly_progress_summaries)
 
 def run_scheduler():
     while True:
