@@ -759,10 +759,33 @@ def handle_sendtask_to(message: types.Message):
 @bot.message_handler(commands=["progress"])
 def handle_progress(message: types.Message):
     chat_id = message.chat.id
+    parts = message.text.strip().split()
+    if len(parts) == 1:  # /progress — show own progress
+        try:
+            text = _def_format_progress(chat_id)
+        except Exception as e:
+            text = f"Could not load your progress right now. Please try again later. ({e})"
+        bot.send_message(chat_id, text)
+        return
+
+    # Admin checking specific student: /progress <chat_id>
+    if not is_admin(chat_id):
+        bot.reply_to(message, "You are not authorized to check other students' progress.")
+        return
+    if len(parts) != 2:
+        bot.reply_to(message, "Usage: <code>/progress</code> (your own) or <code>/progress &lt;chat_id&gt;</code> (admin only)")
+        return
     try:
-        text = _def_format_progress(chat_id)
+        target_chat_id = int(parts[1])
+    except ValueError:
+        bot.reply_to(message, "chat_id must be a number.")
+        return
+    try:
+        text = _def_format_progress(target_chat_id)
+        # Add a note that this is admin view
+        text = f"📊 Progress for student <code>{target_chat_id}</code>:\n\n{text}"
     except Exception as e:
-        text = f"Could not load your progress right now. Please try again later. ({e})"
+        text = f"Could not load progress for that student. ({e})"
     bot.send_message(chat_id, text)
 
 
