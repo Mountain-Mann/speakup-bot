@@ -580,7 +580,7 @@ try:
 except Exception as e:
     print(f"❌ Failed to connect to Telegram: {e}")
     print("Check your bot token!")
-    exit(1)  # Stop if bot can't connect
+    print("Current token starts with:", BOT_TOKEN[:10] if BOT_TOKEN else "EMPTY")
 
 print(f"Admin IDs: {ADMIN_IDS}")
 print(f"Admin feedback chat: {ADMIN_FEEDBACK_CHAT_ID}")
