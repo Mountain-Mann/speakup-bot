@@ -571,6 +571,23 @@ def clear_registration_state(chat_id: int):
 # =======================
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 
+# Debug: Check bot connection
+print("Bot starting...")
+print(f"Bot token: {BOT_TOKEN[:15]}...")
+try:
+    bot_info = bot.get_me()
+    print(f"✅ Bot connected: @{bot_info.username} (ID: {bot_info.id})")
+except Exception as e:
+    print(f"❌ Failed to connect to Telegram: {e}")
+    print("Check your bot token!")
+    exit(1)  # Stop if bot can't connect
+
+print(f"Admin IDs: {ADMIN_IDS}")
+print(f"Admin feedback chat: {ADMIN_FEEDBACK_CHAT_ID}")
+print(f"Work chat: {WORK_CHAT_ID}")
+print(f"Partner chat: {PARTNER_CHAT_ID}")
+print(f"Level channels: {LEVEL_CHANNELS}")
+
 # Maps message IDs in admin DM → student chat_id so reply detection
 # works even when Telegram hides forward_from due to privacy settings.
 _student_reply_map: dict = {}
