@@ -33,9 +33,11 @@ else:
     openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
 # Telegram numeric user IDs for admins (you + business partner)
+# TODO: Update these when swapping to a new bot
 ADMIN_IDS = [1253972975, 515525969]
 
 # Level-specific task library channels (forward tasks from here by level)
+# TODO: Update these when swapping to a new bot (new bot will have different channel IDs)
 LEVEL_CHANNELS = {
     "A1": -1003853572928,
     "A2": -1003790553224,
@@ -44,11 +46,14 @@ LEVEL_CHANNELS = {
 }
 
 # Your DM with the bot (receive student voice replies + transcript/draft here)
+# TODO: Update this when swapping to a new bot
 ADMIN_FEEDBACK_CHAT_ID = 1253972975
 
 # Work chat group (you + partner); student voice results are also sent here (bot must be in the group)
+# TODO: Update this when swapping to a new bot
 WORK_CHAT_ID = -5158365422
 # Partner's DM (so they get practice/test results even if work chat fails)
+# TODO: Update this when swapping to a new bot
 PARTNER_CHAT_ID = 515525969
 
 # Google Sheets configuration (path relative to this script so it works from any cwd)
@@ -249,20 +254,38 @@ def update_task_log_reply(chat_id: int, transcript: str, scores: dict):
 
 
 def get_student_task_log(chat_id: int) -> List[dict]:
-    """Return all Task Log rows for this chat_id as a list of dicts."""
+    """Return all Task Log rows for this chat_id as a list of dicts.
+
+    Matches on Chat ID if available (new tasks), falls back to Student name
+    matching for legacy rows without Chat ID.
+    """
     ws = get_task_log_worksheet()
     all_values = ws.get_all_values()
     if not all_values:
         return []
     headers = all_values[0]
     rows = []
+
+    # Get the student's name for fallback matching
+    student_name = get_student_name(chat_id)
+    chat_id_str = str(chat_id)
+
     try:
         chat_id_col = headers.index("Chat ID")
+        student_col = headers.index("Student")
     except ValueError:
         return []
+
     for row in all_values[1:]:
-        if chat_id_col < len(row) and str(row[chat_id_col]).strip() == str(chat_id):
+        # First try Chat ID match (new rows)
+        if chat_id_col < len(row) and str(row[chat_id_col]).strip() == chat_id_str:
             rows.append(dict(zip(headers, row)))
+            continue
+
+        # Fallback: name match for legacy rows
+        if student_col < len(row) and str(row[student_col]).strip().lower() == student_name.lower():
+            rows.append(dict(zip(headers, row)))
+
     return rows
 
 
