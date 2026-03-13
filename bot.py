@@ -22,7 +22,7 @@ except ImportError:
 # =======================
 BOT_TOKEN = os.getenv(
     "TELEGRAM_BOT_TOKEN",
-    "8534487614:AAFte69Q-FUOtSByRmatNI9IYvHhtrte3vs",
+    "YOUR_NEW_BOT_TOKEN_HERE",
 )
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
