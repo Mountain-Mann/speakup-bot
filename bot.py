@@ -882,6 +882,38 @@ def get_task_script(level: str, task_number: int) -> str:
     return ""
 
 
+def get_task_type(level: str, task_number: int) -> str:
+    """Get the Task Type for this Task # from the level's Task List sheet (e.g., 'Picture Description', 'Directions', etc.)."""
+    ws = _get_task_list_worksheet(level)
+    if not ws:
+        return ""
+    for row in ws.get_all_records():
+        try:
+            num = int(row.get("Task #", 0) or 0)
+            if num == task_number:
+                task_type = row.get("Task Type", "")
+                return str(task_type or "").strip()
+        except (TypeError, ValueError):
+            continue
+    return ""
+
+
+def get_picture_message_id_for_task(level: str, task_number: int) -> Optional[int]:
+    """Get the Picture Message ID for this Task # from the level's Task List sheet (for picture description tasks)."""
+    ws = _get_task_list_worksheet(level)
+    if not ws:
+        return None
+    for row in ws.get_all_records():
+        try:
+            num = int(row.get("Task #", 0) or 0)
+            if num == task_number:
+                pic_id = row.get("Picture Message ID") or row.get("Picture Message id")
+                return int(pic_id) if pic_id not in (None, "") else None
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
 def get_task_example_answers(level: str, task_number: int) -> str:
     """Get the Example Answers for this Task # from the level's Task List sheet."""
     ws = _get_task_list_worksheet(level)
@@ -2685,6 +2717,9 @@ def handle_voice(message: types.Message):
                 print(f"[Forwarded] student_id={student_chat_id} level={level} task#={total_tasks_sent}")
                 print(f"[Forwarded] script_found={bool(task_script)} examples_found={bool(example_answers)}")
 
+                # Get task type to check if this is a picture description task
+                task_type = get_task_type(level, total_tasks_sent) if total_tasks_sent else ""
+                
                 # Generate advanced feedback
                 ai_draft, scores = _run_draft_feedback_and_score(transcript, level, task_script, example_answers)
                 formatted_feedback = _format_feedback_with_scores(ai_draft, scores)
@@ -2696,6 +2731,21 @@ def handle_voice(message: types.Message):
                 )
                 bot.send_message(ADMIN_FEEDBACK_CHAT_ID, transcript_msg)
                 bot.send_message(ADMIN_FEEDBACK_CHAT_ID, formatted_feedback, parse_mode="HTML")
+                
+                # If this is a picture description task, forward the picture for context
+                if task_type and "picture" in task_type.lower():
+                    picture_msg_id = get_picture_message_id_for_task(level, total_tasks_sent)
+                    if picture_msg_id:
+                        try:
+                            bot.forward_message(
+                                chat_id=ADMIN_FEEDBACK_CHAT_ID,
+                                from_chat_id=LEVEL_CHANNELS.get(level),
+                                message_id=picture_msg_id
+                            )
+                            print(f"[Picture Description] Forwarded picture {picture_msg_id} for context")
+                        except Exception as e:
+                            print(f"[Picture Description] Failed to forward picture: {e}")
+                            bot.send_message(ADMIN_FEEDBACK_CHAT_ID, f"⚠️ Could not forward picture for picture description task: {e}")
                 
                 # Log to task log
                 try:
