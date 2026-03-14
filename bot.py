@@ -2508,7 +2508,34 @@ Focus on the most impactful tips for their current level. Keep each tip to 1-2 s
         return "Tips are currently unavailable. Keep practicing regularly!"
 
 
-def _run_draft_feedback_and_score(transcript: str, level: str, task_script: str, example_answers: str = "") -> Tuple[str, dict]:
+def _format_feedback_with_scores(feedback_text: str, scores: dict) -> str:
+    """Format feedback with scores in a clear, organized way."""
+    grammar_score = scores.get("grammar", 0)
+    vocabulary_score = scores.get("vocabulary", 0)
+    fluency_score = scores.get("fluency", 0)
+    avg_score = (grammar_score + vocabulary_score + fluency_score) / 3 if all(scores.values()) else 0
+    
+    score_display = {
+        1: "🔴 Needs significant work",
+        2: "🟠 Developing",
+        3: "🟡 Acceptable",
+        4: "🟢 Good",
+        5: "🟢 Excellent"
+    }
+    
+    formatted = f"""
+📝 <b>FEEDBACK & SCORES</b>
+
+{feedback_text}
+
+<b>📊 Skill Assessment:</b>
+• <b>Grammar:</b> {score_display.get(grammar_score, '?')} ({grammar_score}/5)
+• <b>Vocabulary:</b> {score_display.get(vocabulary_score, '?')} ({vocabulary_score}/5)
+• <b>Fluency:</b> {score_display.get(fluency_score, '?')} ({fluency_score}/5)
+
+<b>Overall:</b> {score_display.get(round(avg_score), '?')} ({avg_score:.1f}/5)
+"""
+    return formatted.strip()
     """Generate AI feedback + skill scores using the task script and example answers as criteria.
 
     Returns (feedback_text, scores) where scores is a dict with keys:
@@ -2536,16 +2563,18 @@ Analyze the student's response according to CEFR {level} criteria:
 
 Identify ALL mistakes and errors made by the student (grammar, vocabulary, pronunciation hints, fluency issues).
 
-Provide detailed, level-appropriate feedback that:
-1. Notes what the student did well
-2. Identifies specific mistakes and areas for improvement
-3. Gives clear, actionable suggestions
-4. References the task requirements and example answers when relevant
-5. Encourages continued progress
+Provide detailed, well-organized feedback with:
+1. What the student did well (positive aspects)
+2. Specific mistakes found (list each error with explanation)
+3. Areas for improvement (clear suggestions with examples)
+4. References to task requirements and example answers when relevant
+5. Encouragement for continued progress
+
+Use bullet points and clear formatting. Be thorough but concise (150-200 words).
 
 Respond ONLY with a valid JSON object (no markdown, no extra text) in this exact format:
 {{
-  "feedback": "<80-120 word detailed feedback covering positives, specific mistakes found, improvements needed, and motivation>",
+  "feedback": "<Well-organized feedback with bullet points, 150-200 words, covering strengths, all specific mistakes found, clear improvements needed, and motivation>",
   "grammar": <1-5>,
   "vocabulary": <1-5>,
   "fluency": <1-5>
@@ -2554,7 +2583,7 @@ Scores: 1=needs significant work (many errors), 2=developing (some errors), 3=ac
         response = openai_client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=400,
+            max_tokens=600,
             temperature=0.7,
             response_format={"type": "json_object"},
         )
@@ -2655,6 +2684,7 @@ def handle_voice(message: types.Message):
 
                 # Generate advanced feedback
                 ai_draft, scores = _run_draft_feedback_and_score(transcript, level, task_script, example_answers)
+                formatted_feedback = _format_feedback_with_scores(ai_draft, scores)
                 
                 transcript_msg = (
                     f"🔄 Forwarded student voice\n"
@@ -2662,7 +2692,7 @@ def handle_voice(message: types.Message):
                     f"Transcript:\n{transcript}"
                 )
                 bot.send_message(ADMIN_FEEDBACK_CHAT_ID, transcript_msg)
-                bot.send_message(ADMIN_FEEDBACK_CHAT_ID, ai_draft)
+                bot.send_message(ADMIN_FEEDBACK_CHAT_ID, formatted_feedback, parse_mode="HTML")
                 
                 # Log to task log
                 try:
@@ -2789,10 +2819,11 @@ def handle_voice(message: types.Message):
         if example_answers:
             print(f"[Voice] First 200 chars of examples: {example_answers[:200]}")
         ai_draft, scores = _run_draft_feedback_and_score(transcript, level, task_script, example_answers)
-        feedback_sent = bot.send_message(ADMIN_FEEDBACK_CHAT_ID, ai_draft)
+        formatted_feedback = _format_feedback_with_scores(ai_draft, scores)
+        feedback_sent = bot.send_message(ADMIN_FEEDBACK_CHAT_ID, formatted_feedback, parse_mode="HTML")
         _student_reply_map[feedback_sent.message_id] = chat_id
         try:
-            bot.send_message(WORK_CHAT_ID, ai_draft)
+            bot.send_message(WORK_CHAT_ID, formatted_feedback, parse_mode="HTML")
         except Exception as e:
             print(f"Failed to send feedback to work chat: {e}")
 
