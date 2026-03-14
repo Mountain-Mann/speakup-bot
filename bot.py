@@ -886,14 +886,27 @@ def get_task_example_answers(level: str, task_number: int) -> str:
     """Get the Example Answers for this Task # from the level's Task List sheet."""
     ws = _get_task_list_worksheet(level)
     if not ws:
+        print(f"[DEBUG] No worksheet found for level: {level}")
         return ""
     for row in ws.get_all_records():
         try:
             num = int(row.get("Task #", 0) or 0)
             if num == task_number:
-                return str(row.get("Example Answers", row.get("example answers", "")) or "").strip()
-        except (TypeError, ValueError):
+                # Try multiple column name variations
+                examples = (
+                    row.get("Example Answers")
+                    or row.get("example answers")
+                    or row.get("Example Answer")
+                    or row.get("example answer")
+                    or ""
+                )
+                examples_str = str(examples or "").strip()
+                print(f"[DEBUG] Task {task_number} - Examples found: {bool(examples_str)} (len={len(examples_str)})")
+                return examples_str
+        except (TypeError, ValueError) as e:
+            print(f"[DEBUG] Error processing row for task {task_number}: {e}")
             continue
+    print(f"[DEBUG] Task {task_number} not found in worksheet for level {level}")
     return ""
 
 
@@ -2510,6 +2523,7 @@ def _run_draft_feedback_and_score(transcript: str, level: str, task_script: str,
         import json as _json
         criteria = f'\nUse this task script as the criteria for feedback:\n"""\n{task_script}\n"""' if task_script else ""
         examples = f'\nReference these example answers for accuracy and completeness:\n"""\n{example_answers}\n"""' if example_answers else ""
+        print(f"[DEBUG] Feedback generation: task_script_len={len(task_script)}, examples_len={len(example_answers)}, has_examples={bool(example_answers)}")
         prompt = f"""You are an ESL teacher evaluating a {level} level student.
 
 Student's transcript: "{transcript}"
@@ -2615,9 +2629,11 @@ def handle_voice(message: types.Message):
             temp_path = os.path.join(_BOT_DIR, "temp_reply.ogg")
             with open(temp_path, "wb") as f:
                 f.write(downloaded_file)
-            transcript, ai_draft = _run_transcribe_and_draft(temp_path, level_label)
+            # For testing/practice, use a default level (assumes admin knows what level they're testing)
+            # Note: Practice mode doesn't have task context, so example answers won't be used
+            transcript, ai_draft = _run_transcribe_and_draft(temp_path, "B1")
             transcript_msg = (
-                f"🧪 {level_label} voice\n"
+                f"🧪 {level_label} voice (using B1 level for feedback)\n"
                 f"Transcript:\n{transcript}"
             )
             feedback_msg = ai_draft
@@ -2708,6 +2724,10 @@ def handle_voice(message: types.Message):
 
         # Message 3: clean AI draft (no header — ready to forward or copy-paste to student)
         example_answers = get_task_example_answers(level, total_tasks_sent) if total_tasks_sent else ""
+        print(f"[Voice] Retrieving example answers: level={level}, task_number={total_tasks_sent}")
+        print(f"[Voice] Example answers retrieved: {bool(example_answers)} (len={len(example_answers)})")
+        if example_answers:
+            print(f"[Voice] First 200 chars of examples: {example_answers[:200]}")
         ai_draft, scores = _run_draft_feedback_and_score(transcript, level, task_script, example_answers)
         feedback_sent = bot.send_message(ADMIN_FEEDBACK_CHAT_ID, ai_draft)
         _student_reply_map[feedback_sent.message_id] = chat_id
