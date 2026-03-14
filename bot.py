@@ -68,6 +68,8 @@ REGISTRATION_STATE_PATH = os.path.join(_BOT_DIR, "registration_state.json")
 # Task list tabs: "A2 Task List", "B2 Task List" (etc.) with columns "Task #", "Message ID" (channel), "Script Text"
 # Task Log tab: Date Sent, Student, Task #, Voice File Name, Reply Received, Week #, Level (Total Tasks Sent in Students is formula from this)
 TASK_LOG_SHEET_NAME = "Task Log"
+SETTINGS_SHEET_NAME = "Settings"
+SETTINGS_HEADERS = ["Chat ID", "Language", "Notifications", "Referral Code", "Referral Count", "Status", "Last Activity"]
 TASK_LOG_HEADERS = [
     "Date Sent", "Student", "Task #", "Voice File Name", "Reply Received", "Week #", "Level",
     "Chat ID", "Transcript", "Pronunciation", "Grammar", "Vocabulary", "Fluency",
@@ -343,11 +345,126 @@ def _def_skill_label(avg: float) -> str:
     return "needs focus"
 
 
-def _def_format_progress(chat_id: int) -> str:
-    """Build the full /progress message for a student."""
+def _def_format_stats(chat_id: int, period: str = "all") -> Tuple[str, types.InlineKeyboardMarkup]:
+    """Build concise stats message with time period selection."""
+    settings = get_student_settings(chat_id)
+    lang = settings.get("Language", "en")
+
     rows = get_student_task_log(chat_id)
     if not rows:
-        return "No task history found yet. Complete your first task to start tracking progress!"
+        if lang == "ru":
+            return "История заданий не найдена. Выполните первое задание, чтобы начать отслеживать статистику!", None
+        else:
+            return "No task history found yet. Complete your first task to start tracking statistics!", None
+
+    # Filter by time period
+    now = _now_moscow()
+    filtered_rows = []
+    if period == "week":
+        week_start = now - timedelta(days=now.weekday())  # Monday of current week
+        filtered_rows = [r for r in rows if r.get("Date Sent") and datetime.strptime(r["Date Sent"][:10], "%Y-%m-%d") >= week_start]
+    elif period == "month":
+        month_start = now.replace(day=1)
+        filtered_rows = [r for r in rows if r.get("Date Sent") and datetime.strptime(r["Date Sent"][:10], "%Y-%m-%d") >= month_start]
+    else:  # all time
+        filtered_rows = rows
+
+    total_sent = len(filtered_rows)
+    replied_rows = [r for r in filtered_rows if r.get("Reply Received")]
+    total_replied = len(replied_rows)
+    reply_rate = round(total_replied / total_sent * 100) if total_sent else 0
+
+    level, _ = get_student_level_and_total_tasks(chat_id)
+
+    # Quick skill averages from replied tasks
+    skills = ["Pronunciation", "Grammar", "Vocabulary", "Fluency"]
+    averages = {}
+    for skill in skills:
+        vals = _def_scores(replied_rows, skill)
+        averages[skill] = round(sum(vals) / len(vals), 1) if vals else 0.0
+
+    scored_skills = {k: v for k, v in averages.items() if v > 0}
+
+    # Create inline keyboard for period selection
+    markup = types.InlineKeyboardMarkup(row_width=3)
+    period_buttons = []
+    periods = [("all", "All Time"), ("month", "This Month"), ("week", "This Week")]
+    period_labels = {
+        "all": ("All Time", "Все время"),
+        "month": ("This Month", "Этот месяц"),
+        "week": ("This Week", "Эта неделя")
+    }
+
+    for p, _ in periods:
+        label = period_labels[p][1] if lang == "ru" else period_labels[p][0]
+        period_buttons.append(types.InlineKeyboardButton(
+            f"{'✓ ' if p == period else ''}{label}",
+            callback_data=f"stats_{p}"
+        ))
+    markup.add(*period_buttons)
+
+    # Build message
+    if lang == "ru":
+        period_names = {"all": "за всё время", "month": "этот месяц", "week": "эту неделю"}
+        period_name = period_names.get(period, "весь период")
+
+        lines = [
+            f"<b>📊 Статистика ({period_name})</b>",
+            "",
+            f"Уровень: <b>{level}</b>",
+            f"Заданий: <b>{total_sent}</b> | Ответов: <b>{total_replied}</b> ({reply_rate}%)",
+        ]
+
+        if scored_skills:
+            lines.append("")
+            lines.append("<b>Средние оценки:</b>")
+            skill_names_ru = {
+                "Pronunciation": "Произношение",
+                "Grammar": "Грамматика",
+                "Vocabulary": "Лексика",
+                "Fluency": "Беглость"
+            }
+            for skill in ["Grammar", "Vocabulary", "Fluency"]:  # Skip pronunciation for now
+                avg = averages[skill]
+                if avg > 0:
+                    bar = _def_score_bar(avg)
+                    lines.append(f"  {skill_names_ru[skill]}: {bar} {avg}/5")
+
+        return "\n".join(lines), markup
+    else:
+        period_names = {"all": "all time", "month": "this month", "week": "this week"}
+        period_name = period_names.get(period, "selected period")
+
+        lines = [
+            f"<b>📊 Quick Stats ({period_name})</b>",
+            "",
+            f"Level: <b>{level}</b>",
+            f"Tasks: <b>{total_sent}</b> | Replied: <b>{total_replied}</b> ({reply_rate}%)",
+        ]
+
+        if scored_skills:
+            lines.append("")
+            lines.append("<b>Average Scores:</b>")
+            for skill in ["Grammar", "Vocabulary", "Fluency"]:  # Skip pronunciation for now
+                avg = averages[skill]
+                if avg > 0:
+                    bar = _def_score_bar(avg)
+                    lines.append(f"  {skill}: {bar} {avg}/5")
+
+        return "\n".join(lines), markup
+
+
+def _def_format_progress(chat_id: int) -> str:
+    """Build the full /progress message for a student."""
+    settings = get_student_settings(chat_id)
+    lang = settings.get("Language", "ru")
+
+    rows = get_student_task_log(chat_id)
+    if not rows:
+        if lang == "ru":
+            return "История заданий не найдена. Выполните первое задание, чтобы начать отслеживать прогресс!"
+        else:
+            return "No task history found yet. Complete your first task to start tracking progress!"
 
     total_sent = len(rows)
     replied_rows = [r for r in rows if r.get("Reply Received")]
@@ -368,29 +485,63 @@ def _def_format_progress(chat_id: int) -> str:
     scored_skills = {k: v for k, v in averages.items() if v > 0}
     weakest = min(scored_skills, key=scored_skills.get) if scored_skills else None
 
-    streak_str = f"🔥 {streak} week{'s' if streak != 1 else ''} in a row" if streak >= 2 else ("✅ Active this week" if streak == 1 else "No streak yet — reply this week to start one!")
+    if lang == "ru":
+        streak_str = f"🔥 {streak} недел{'ь' if streak == 1 else ('и' if 2 <= streak <= 4 else 'ь')}" if streak >= 2 else ("✅ Активен на этой неделе" if streak == 1 else "Пока нет серии — ответьте на этой неделе, чтобы начать!")
 
-    lines = [
-        "<b>Your SpeakUp Progress</b>",
-        "",
-        f"Level: <b>{level}</b>  |  Tasks sent: <b>{total_sent}</b>",
-        f"Replied: <b>{total_replied}</b> of {total_sent} ({reply_rate}%)",
-        f"Streak: {streak_str}",
-    ]
+        lines = [
+            "<b>Ваш прогресс в SpeakUp</b>",
+            "",
+            f"Уровень: <b>{level}</b>  |  Заданий отправлено: <b>{total_sent}</b>",
+            f"Ответов: <b>{total_replied}</b> из {total_sent} ({reply_rate}%)",
+            f"Серия: {streak_str}",
+        ]
 
-    if scored_skills:
-        lines += ["", "<b>Skill averages (last 10 tasks):</b>"]
-        for skill in skills:
-            avg = averages[skill]
-            if avg > 0:
-                bar = _def_score_bar(avg)
-                label = _def_skill_label(avg)
-                lines.append(f"  {skill}: {bar} {avg}/5 — {label}")
+        if scored_skills:
+            lines += ["", "<b>Средние оценки навыков (последние 10 заданий):</b>"]
+            skill_names_ru = {
+                "Pronunciation": "Произношение",
+                "Grammar": "Грамматика",
+                "Vocabulary": "Лексика",
+                "Fluency": "Беглость"
+            }
+            for skill in skills:
+                avg = averages[skill]
+                if avg > 0:
+                    bar = _def_score_bar(avg)
+                    label = _def_skill_label(avg)
+                    ru_name = skill_names_ru.get(skill, skill)
+                    lines.append(f"  {ru_name}: {bar} {avg}/5 — {label}")
 
-    if weakest:
-        lines += ["", f"Focus area: <b>{weakest}</b> — keep practising, you're making progress!"]
+        if weakest:
+            weakest_ru = skill_names_ru.get(weakest, weakest)
+            lines += ["", f"Область для фокуса: <b>{weakest_ru}</b> — продолжайте практиковаться, вы прогрессируете!"]
 
-    return "\n".join(lines)
+        return "\n".join(lines)
+    else:
+        # English version (existing code)
+        streak_str = f"🔥 {streak} week{'s' if streak != 1 else ''} in a row" if streak >= 2 else ("✅ Active this week" if streak == 1 else "No streak yet — reply this week to start one!")
+
+        lines = [
+            "<b>Your SpeakUp Progress</b>",
+            "",
+            f"Level: <b>{level}</b>  |  Tasks sent: <b>{total_sent}</b>",
+            f"Replied: <b>{total_replied}</b> of {total_sent} ({reply_rate}%)",
+            f"Streak: {streak_str}",
+        ]
+
+        if scored_skills:
+            lines += ["", "<b>Skill averages (last 10 tasks):</b>"]
+            for skill in skills:
+                avg = averages[skill]
+                if avg > 0:
+                    bar = _def_score_bar(avg)
+                    label = _def_skill_label(avg)
+                    lines.append(f"  {skill}: {bar} {avg}/5 — {label}")
+
+        if weakest:
+            lines += ["", f"Focus area: <b>{weakest}</b> — keep practising, you're making progress!"]
+
+        return "\n".join(lines)
 
 
 def _def_format_monthly_summary(chat_id: int, month_rows: List[dict], prev_rows: List[dict]) -> str:
@@ -472,6 +623,208 @@ def _def_all_student_chat_ids() -> List[int]:
         except (TypeError, ValueError):
             continue
     return chat_ids
+
+
+def _generate_referral_code(chat_id: int) -> str:
+    """Generate a unique referral code for a student."""
+    import hashlib
+    import time
+    # Create deterministic but unique code based on chat_id and timestamp
+    seed = f"{chat_id}_{int(time.time()) // 86400}"  # Changes daily for uniqueness
+    code = hashlib.md5(seed.encode()).hexdigest()[:8].upper()
+    return f"SPK{code}"
+
+
+def _get_referral_stats(chat_id: int) -> dict:
+    """Get referral statistics for a student."""
+    settings = get_student_settings(chat_id)
+    code = settings.get("Referral Code", "")
+    if not code:
+        # Generate code if doesn't exist
+        code = _generate_referral_code(chat_id)
+        update_student_setting(chat_id, "Referral Code", code)
+
+    count = settings.get("Referral Count", 0)
+    link = f"https://t.me/{BOT_TOKEN.split(':')[0]}?start=ref_{code}"
+
+    return {
+        "code": code,
+        "count": count,
+        "link": link,
+        "reward_threshold": 3,  # Referrals needed for reward
+        "reward_earned": count >= 3
+    }
+
+
+def _process_referral_join(new_chat_id: int, referral_code: str):
+    """Process when a new student joins via referral link."""
+    # Find the referrer
+    ws = get_settings_worksheet()
+    referrer_id = None
+    for row in ws.get_all_records():
+        if row.get("Referral Code") == referral_code:
+            try:
+                referrer_id = int(row.get("Chat ID"))
+                break
+            except (TypeError, ValueError):
+                continue
+
+    if referrer_id:
+        # Increment referral count
+        current_count = get_student_settings(referrer_id).get("Referral Count", 0)
+        update_student_setting(referrer_id, "Referral Count", current_count + 1)
+
+        # Store referral relationship (could add to separate sheet later)
+        update_student_setting(new_chat_id, "Referred By", str(referrer_id))
+
+        # Notify referrer if they hit reward threshold
+        if current_count + 1 >= 3:
+            try:
+                bot.send_message(
+                    referrer_id,
+                    "🎉 Congratulations! You've successfully referred 3 friends.\n\n"
+                    "You've earned a free month of premium access!\n"
+                    "Contact your teacher to claim your reward."
+                )
+            except Exception as e:
+                print(f"Could not notify referrer {referrer_id}: {e}")
+
+
+def _get_analytics_data() -> dict:
+    """Generate analytics data for dashboard."""
+    students_ws = get_students_worksheet()
+    task_ws = get_task_log_worksheet()
+    settings_ws = get_settings_worksheet()
+
+    all_students = students_ws.get_all_records()
+    all_tasks = task_ws.get_all_records()
+    all_settings = settings_ws.get_all_records()
+
+    # Basic metrics
+    total_students = len([s for s in all_students if s.get("Chat ID")])
+    active_students = len([s for s in all_students if s.get("Level") and s.get("Chat ID")])
+
+    # Level distribution
+    levels = {}
+    for student in all_students:
+        level = student.get("Level", "")
+        if level:
+            levels[level] = levels.get(level, 0) + 1
+
+    # Task completion stats
+    total_tasks_sent = len(all_tasks)
+    total_replies = len([t for t in all_tasks if t.get("Reply Received")])
+    completion_rate = round(total_replies / total_tasks_sent * 100, 1) if total_tasks_sent else 0
+
+    # Recent activity (last 30 days)
+    now = _now_moscow()
+    month_ago = now - timedelta(days=30)
+    recent_tasks = []
+    for task in all_tasks:
+        try:
+            task_date = datetime.strptime(task.get("Date Sent", "")[:10], "%Y-%m-%d")
+            if task_date >= month_ago:
+                recent_tasks.append(task)
+        except (ValueError, KeyError):
+            continue
+
+    recent_replies = len([t for t in recent_tasks if t.get("Reply Received")])
+
+    # Language preferences
+    lang_stats = {}
+    for setting in all_settings:
+        lang = setting.get("Language", "en")
+        lang_stats[lang] = lang_stats.get(lang, 0) + 1
+
+    return {
+        "total_students": total_students,
+        "active_students": active_students,
+        "level_distribution": levels,
+        "total_tasks": total_tasks_sent,
+        "total_replies": total_replies,
+        "completion_rate": completion_rate,
+        "recent_tasks": len(recent_tasks),
+        "recent_replies": recent_replies,
+        "language_stats": lang_stats
+    }
+
+
+def get_settings_worksheet():
+    client = get_gspread_client()
+    spreadsheet = client.open(SPREADSHEET_NAME)
+    try:
+        ws = spreadsheet.worksheet(SETTINGS_SHEET_NAME)
+    except gspread.WorksheetNotFound:
+        ws = spreadsheet.add_worksheet(title=SETTINGS_SHEET_NAME, rows="1000", cols=len(SETTINGS_HEADERS))
+        ws.append_row(SETTINGS_HEADERS)
+    return ws
+
+
+def get_student_settings(chat_id: int) -> dict:
+    """Get student settings, with defaults."""
+    ws = get_settings_worksheet()
+    for row in ws.get_all_records():
+        if str(row.get("Chat ID")) == str(chat_id):
+            return row
+    # Return defaults if no settings found
+    return {
+        "Chat ID": str(chat_id),
+        "Language": "en",  # Default to English
+        "Notifications": "on",
+        "Referral Code": "",
+        "Referral Count": 0,
+        "Status": "active",
+        "Last Activity": "",
+        "Maintenance Mode": "off"
+    }
+
+
+def update_student_setting(chat_id: int, key: str, value: str):
+    """Update a single setting for a student."""
+    ws = get_settings_worksheet()
+    all_values = ws.get_all_values()
+    if not all_values:
+        return
+
+    headers = all_values[0]
+    try:
+        chat_id_col = headers.index("Chat ID")
+        key_col = headers.index(key)
+    except ValueError:
+        return
+
+    # Find existing row or create new one
+    target_row_idx = None
+    for i in range(1, len(all_values)):
+        if str(all_values[i][chat_id_col]) == str(chat_id):
+            target_row_idx = i + 1
+            break
+
+    if target_row_idx is None:
+        # Create new row
+        new_row = [str(chat_id) if col == chat_id_col else (value if headers[col] == key else "") for col in range(len(headers))]
+        ws.append_row(new_row)
+    else:
+        # Update existing row
+        ws.update_cell(target_row_idx, key_col + 1, value)
+
+
+def is_maintenance_mode() -> bool:
+    """Check if bot is in maintenance mode globally."""
+    ws = get_settings_worksheet()
+    try:
+        # Look for admin row (chat_id = 0) maintenance setting
+        for row in ws.get_all_records():
+            if str(row.get("Chat ID")) == "0" and row.get("Maintenance Mode") == "on":
+                return True
+    except:
+        pass
+    return False
+
+
+def set_maintenance_mode(enabled: bool):
+    """Set global maintenance mode."""
+    update_student_setting(0, "Maintenance Mode", "on" if enabled else "off")
 
 
 def _def_get_all_levels() -> dict:
@@ -794,6 +1147,245 @@ def handle_sendtask_to(message: types.Message):
     )
 
 # =======================
+# COMMAND: /help (interactive help menu)
+# =======================
+def _help_keyboard(is_admin: bool = False) -> types.InlineKeyboardMarkup:
+    """Create help keyboard based on user role."""
+    markup = types.InlineKeyboardMarkup(row_width=2)
+
+    if is_admin:
+        markup.add(
+            types.InlineKeyboardButton("👥 Student Management", callback_data="help_admin_students"),
+            types.InlineKeyboardButton("📊 Analytics & Reports", callback_data="help_admin_analytics"),
+            types.InlineKeyboardButton("⚙️ System & Maintenance", callback_data="help_admin_system"),
+            types.InlineKeyboardButton("📋 All Commands", callback_data="help_admin_commands"),
+        )
+    else:
+        markup.add(
+            types.InlineKeyboardButton("📚 Learning Commands", callback_data="help_student_learning"),
+            types.InlineKeyboardButton("📊 Progress & Stats", callback_data="help_student_progress"),
+            types.InlineKeyboardButton("⚙️ Settings & Account", callback_data="help_student_settings"),
+            types.InlineKeyboardButton("📋 All Commands", callback_data="help_student_commands"),
+        )
+
+    markup.add(types.InlineKeyboardButton("❌ Close", callback_data="help_close"))
+    return markup
+
+
+@bot.message_handler(commands=["help"])
+def handle_help(message: types.Message):
+    chat_id = message.chat.id
+    is_admin_user = is_admin(chat_id)
+
+    settings = get_student_settings(chat_id) if not is_admin_user else {}
+    lang = settings.get("Language", "en")
+
+    if is_admin_user:
+        intro = "🛠️ <b>Admin Help Menu</b>\n\nChoose a category below to see available commands and how to use them."
+    else:
+        intro = "📚 <b>SpeakUp Help Menu</b>\n\nChoose a category below to learn about available commands.\n\n💡 <i>Tip: You can also type commands directly or use the buttons below.</i>"
+
+    if lang == "ru" and not is_admin_user:
+        intro = "📚 <b>Меню помощи SpeakUp</b>\n\nВыберите категорию ниже, чтобы узнать о доступных командах.\n\n💡 <i>Подсказка: Вы можете вводить команды напрямую или использовать кнопки ниже.</i>"
+
+    bot.send_message(chat_id, intro, reply_markup=_help_keyboard(is_admin_user))
+
+
+@bot.callback_query_handler(func=lambda c: c.data and c.data.startswith("help_"))
+def handle_help_callbacks(callback: types.CallbackQuery):
+    chat_id = callback.message.chat.id
+    data = callback.data
+    is_admin_user = is_admin(chat_id)
+
+    settings = get_student_settings(chat_id) if not is_admin_user else {}
+    lang = settings.get("Language", "en")
+
+    bot.answer_callback_query(callback.id)
+
+    if data == "help_close":
+        bot.edit_message_text("Help menu closed. Type /help anytime to reopen!", chat_id, callback.message.message_id)
+        return
+
+    # Student help sections
+    if data == "help_student_learning":
+        text = """📚 <b>Learning Commands</b>
+
+🎯 <b>/vocabulary</b> — Practice vocabulary with flashcards
+✍️ <b>/practice</b> — Extra practice exercises (sentence building, etc.)
+💡 <b>/tips</b> — Get personalized study tips based on your progress
+📖 <b>/dictionary [word]</b> — Quick word lookup with examples
+📝 <b>/examples [grammar]</b> — Example sentences for grammar points
+
+<i>Example: /dictionary hello</i>"""
+        if lang == "ru":
+            text = """📚 <b>Команды обучения</b>
+
+🎯 <b>/vocabulary</b> — Практика словарного запаса с flashcards
+✍️ <b>/practice</b> — Дополнительные упражнения (построение предложений и т.д.)
+💡 <b>/tips</b> — Персональные советы по изучению на основе вашего прогресса
+📖 <b>/dictionary [слово]</b> — Быстрый поиск слова с примерами
+📝 <b>/examples [грамматика]</b> — Примеры предложений для грамматических правил
+
+<i>Пример: /dictionary hello</i>"""
+
+    elif data == "help_student_progress":
+        text = """📊 <b>Progress & Stats Commands</b>
+
+📈 <b>/progress</b> — View your detailed progress report
+📊 <b>/stats</b> — Quick statistics and skill averages
+🔗 <b>/referral</b> — Get your referral link to invite friends
+⏰ <b>/remind [hours]</b> — Set reminder for next task
+
+<i>Your progress is automatically tracked and scored!</i>"""
+        if lang == "ru":
+            text = """📊 <b>Команды прогресса и статистики</b>
+
+📈 <b>/progress</b> — Посмотреть детальный отчет о прогрессе
+📊 <b>/stats</b> — Быстрая статистика и средние оценки навыков
+🔗 <b>/referral</b> — Получить реферальную ссылку для приглашения друзей
+⏰ <b>/remind [часы]</b> — Установить напоминание для следующего задания
+
+<i>Ваш прогресс автоматически отслеживается и оценивается!</i>"""
+
+    elif data == "help_student_settings":
+        text = """⚙️ <b>Settings & Account Commands</b>
+
+🌐 <b>Language Settings</b>
+Use buttons below to switch languages:
+
+<i>Current: English</i>"""
+        if lang == "ru":
+            text = """⚙️ <b>Настройки аккаунта</b>
+
+🌐 <b>Настройки языка</b>
+Используйте кнопки ниже для переключения языка:
+
+<i>Текущий: Русский</i>"""
+
+        # Add language toggle buttons
+        markup = types.InlineKeyboardMarkup()
+        markup.add(
+            types.InlineKeyboardButton("🇺🇸 English", callback_data="lang_en"),
+            types.InlineKeyboardButton("🇷🇺 Русский", callback_data="lang_ru")
+        )
+        markup.add(types.InlineKeyboardButton("⬅️ Back to Help", callback_data="help_back"))
+
+        bot.edit_message_text(text, chat_id, callback.message.message_id, reply_markup=markup)
+        return
+
+    elif data == "help_student_commands":
+        text = """📋 <b>All Student Commands</b>
+
+/start — Register or change your level
+/help — This help menu
+/progress — Detailed progress report
+/stats — Quick statistics
+/vocabulary — Vocabulary flashcards
+/practice — Extra practice exercises
+/tips — Study tips
+/dictionary [word] — Word lookup
+/examples [grammar] — Grammar examples
+/referral — Get referral link
+/remind [hours] — Set task reminder
+/settings — Account preferences"""
+        if lang == "ru":
+            text = """📋 <b>Все команды для студентов</b>
+
+/start — Регистрация или смена уровня
+/help — Это меню помощи
+/progress — Детальный отчет о прогрессе
+/stats — Быстрая статистика
+/vocabulary — Флэшкарты словарного запаса
+/practice — Дополнительные упражнения
+/tips — Советы по изучению
+/dictionary [слово] — Поиск слова
+/examples [грамматика] — Примеры грамматики
+/referral — Получить реферальную ссылку
+/remind [часы] — Установить напоминание
+/settings — Настройки аккаунта"""
+
+    # Admin help sections
+    elif data == "help_admin_students":
+        text = """👥 <b>Student Management Commands</b>
+
+📋 <b>/liststudents</b> — List all students by level
+👤 <b>/studentinfo [chat_id]</b> — Detailed student profile
+🚫 <b>/suspend [chat_id]</b> — Temporarily suspend student
+✅ <b>/unsuspend [chat_id]</b> — Restore student access
+📢 <b>/messageall [level]</b> — Send announcement to level
+❌ <b>/kick [chat_id]</b> — Remove student from system
+
+<i>Example: /studentinfo 123456789</i>"""
+
+    elif data == "help_admin_analytics":
+        text = """📊 <b>Analytics & Reports Commands</b>
+
+📈 <b>/analytics</b> — Weekly/monthly statistics
+📄 <b>/report [student]</b> — Detailed student report
+👥 <b>/inactive [days]</b> — List inactive students
+
+<i>Use /analytics to see completion rates and growth trends</i>"""
+
+    elif data == "help_admin_system":
+        text = """⚙️ <b>System & Maintenance Commands</b>
+
+🔍 <b>/preview [level] [task#]</b> — Test task appearance
+🧪 <b>/test</b> — Test admin chat connections
+📝 <b>/logs</b> — View recent bot activity
+🔧 <b>/maintenance [on/off]</b> — Enter/exit maintenance mode
+
+<i>Use /test after bot restarts to verify connections</i>"""
+
+    elif data == "help_admin_commands":
+        text = """📋 <b>All Admin Commands</b>
+
+/sendtask [level] — Send tasks to all students in level
+/sendtaskto [level] [chat_id] — Send task to specific student
+/liststudents — List students by level
+/studentinfo [chat_id] — Student profile
+/suspend [chat_id] — Suspend student
+/unsuspend [chat_id] — Unsuspend student
+/messageall [level] — Send announcement
+/kick [chat_id] — Remove student
+/progress [chat_id] — Check student progress
+/analytics — View statistics
+/report [student] — Generate report
+/inactive [days] — Find inactive students
+/preview [level] [task#] — Test task
+/test — Test connections
+/logs — View activity logs
+/maintenance [on/off] — Maintenance mode"""
+
+    elif data == "lang_en":
+        update_student_setting(chat_id, "Language", "en")
+        bot.answer_callback_query(callback.id, "Language set to English 🇺🇸")
+        bot.edit_message_text("✅ Language changed to English!\n\nType /help to see the updated menu.", chat_id, callback.message.message_id)
+        return
+
+    elif data == "lang_ru":
+        update_student_setting(chat_id, "Language", "ru")
+        bot.answer_callback_query(callback.id, "Язык изменен на русский 🇷🇺")
+        bot.edit_message_text("✅ Язык изменен на русский!\n\nВведите /help для обновленного меню.", chat_id, callback.message.message_id)
+        return
+
+    elif data == "help_back":
+        intro = "📚 <b>SpeakUp Help Menu</b>\n\nChoose a category below to learn about available commands."
+        if lang == "ru":
+            intro = "📚 <b>Меню помощи SpeakUp</b>\n\nВыберите категорию ниже, чтобы узнать о доступных командах."
+        bot.edit_message_text(intro, chat_id, callback.message.message_id, reply_markup=_help_keyboard(is_admin_user))
+        return
+
+    else:
+        text = "Unknown help section."
+
+    # Add back button to all help sections
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("⬅️ Back to Help", callback_data="help_back"))
+
+    bot.edit_message_text(text, chat_id, callback.message.message_id, reply_markup=markup)
+
+
+# =======================
 # COMMAND: /progress (student-facing)
 # =======================
 @bot.message_handler(commands=["progress"])
@@ -801,6 +1393,9 @@ def handle_progress(message: types.Message):
     chat_id = message.chat.id
     parts = message.text.strip().split()
     if len(parts) == 1:  # /progress — show own progress
+        if is_maintenance_mode() and not is_admin(chat_id):
+            bot.send_message(chat_id, "🔧 Bot is currently under maintenance. Please try again later.")
+            return
         try:
             text = _def_format_progress(chat_id)
         except Exception as e:
@@ -872,6 +1467,178 @@ Create short, encouraging feedback (60-100 words): positive comment, 1-2 improve
         except Exception as e:
             ai_draft = f"[GPT error: {e}]"
     return transcript, ai_draft
+
+
+def _generate_vocabulary_flashcards(level: str, weak_areas: List[str] = None) -> List[dict]:
+    """Generate 5-7 vocabulary flashcards based on student level and weak areas."""
+    if not openai_client:
+        return []
+
+    weak_focus = ""
+    if weak_areas and "vocabulary" in [a.lower() for a in weak_areas]:
+        weak_focus = " Focus especially on vocabulary gaps that students at this level commonly have."
+
+    prompt = f"""Generate 5 vocabulary flashcards for {level} level English students.
+
+Each flashcard should be a JSON object with:
+- "word": the vocabulary word/phrase
+- "definition": clear, simple definition
+- "example": a natural example sentence using the word
+- "difficulty": "beginner", "intermediate", or "advanced"
+- "category": "academic", "everyday", "business", or "general"
+
+{weak_focus}
+
+Respond with a JSON array of 5 flashcards."""
+
+    try:
+        response = openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=800,
+            temperature=0.8,
+            response_format={"type": "json_object"},
+        )
+        import json as _json
+        data = _json.loads(response.choices[0].message.content.strip())
+        return data.get("flashcards", []) if isinstance(data, dict) else data
+    except Exception as e:
+        print(f"Vocabulary generation error: {e}")
+        return []
+
+
+def _generate_practice_exercise(level: str, weak_skills: List[str] = None) -> dict:
+    """Generate a single practice exercise based on student's weak areas."""
+    if not openai_client:
+        return {"type": "error", "content": "Practice exercises are currently unavailable."}
+
+    focus_area = weak_skills[0] if weak_skills else "general"
+    exercise_types = {
+        "grammar": "sentence correction",
+        "vocabulary": "fill-in-the-blank with synonyms",
+        "fluency": "sentence building",
+        "general": "mixed practice"
+    }
+
+    exercise_type = exercise_types.get(focus_area, "mixed practice")
+
+    prompt = f"""Create a single {exercise_type} exercise for a {level} level English student.
+
+Respond with a JSON object containing:
+- "exercise": the exercise text/question
+- "correct_answer": the expected answer
+- "explanation": brief explanation of the correct answer
+- "difficulty": "easy", "medium", or "hard"
+- "skill_focus": what skill this targets
+
+Make it challenging but appropriate for their level."""
+
+    try:
+        response = openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=300,
+            temperature=0.8,
+            response_format={"type": "json_object"},
+        )
+        import json as _json
+        data = _json.loads(response.choices[0].message.content.strip())
+        return data
+    except Exception as e:
+        return {"type": "error", "content": f"Could not generate exercise: {e}"}
+
+
+def _lookup_word(word: str, level: str = "intermediate") -> dict:
+    """Get definition and examples for a word using OpenAI."""
+    if not openai_client:
+        return {"definition": "Dictionary lookup is currently unavailable.", "examples": []}
+
+    prompt = f"""Provide a dictionary entry for the word "{word}" appropriate for {level} level English learners.
+
+Respond with a JSON object containing:
+- "definition": clear, simple definition (1-2 sentences)
+- "part_of_speech": noun/verb/adjective/etc.
+- "examples": array of 2-3 natural example sentences
+- "synonyms": array of 2-3 common synonyms (if applicable)
+- "difficulty": "beginner", "intermediate", or "advanced"
+
+Keep definitions simple and examples natural."""
+
+    try:
+        response = openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=400,
+            temperature=0.3,  # Lower temperature for more consistent definitions
+            response_format={"type": "json_object"},
+        )
+        import json as _json
+        data = _json.loads(response.choices[0].message.content.strip())
+        return data
+    except Exception as e:
+        return {"definition": f"Could not look up '{word}': {e}", "examples": []}
+
+
+def _generate_grammar_examples(grammar_point: str, level: str) -> List[str]:
+    """Generate example sentences for a specific grammar point."""
+    if not openai_client:
+        return ["Examples are currently unavailable."]
+
+    prompt = f"""Generate 5 example sentences demonstrating "{grammar_point}" for {level} level English students.
+
+Each sentence should:
+- Be natural and appropriate for the level
+- Clearly show the grammar point in use
+- Include a variety of contexts
+
+Respond with a JSON array of 5 sentences."""
+
+    try:
+        response = openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=300,
+            temperature=0.7,
+            response_format={"type": "json_object"},
+        )
+        import json as _json
+        data = _json.loads(response.choices[0].message.content.strip())
+        return data if isinstance(data, list) else ["Could not generate examples."]
+    except Exception as e:
+        return [f"Could not generate examples for '{grammar_point}': {e}"]
+
+
+def _generate_personalized_tips(transcript_history: List[str], skill_scores: dict, level: str) -> str:
+    """Generate personalized study tips based on student's performance."""
+    if not openai_client:
+        return "Personalized tips are currently unavailable."
+
+    # Analyze patterns from recent transcripts and scores
+    recent_transcripts = transcript_history[-5:] if transcript_history else []
+    transcript_sample = " ".join(recent_transcripts)[:500]  # Limit length
+
+    weak_skills = [k for k, v in skill_scores.items() if v > 0 and v < 3.5]
+    strong_skills = [k for k, v in skill_scores.items() if v >= 4.0]
+
+    prompt = f"""As an ESL teacher, analyze this {level} student's performance and give 3 specific, actionable study tips.
+
+Recent transcript samples: "{transcript_sample}"
+Skill scores (1-5 scale): {skill_scores}
+Weak areas: {weak_skills}
+Strong areas: {strong_skills}
+
+Focus on the most impactful tips for their current level. Keep each tip to 1-2 sentences. Be encouraging and specific."""
+
+    try:
+        response = openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=250,
+            temperature=0.7,
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        return "Tips are currently unavailable. Keep practicing regularly!"
 
 
 def _run_draft_feedback_and_score(transcript: str, level: str, task_script: str) -> Tuple[str, dict]:
