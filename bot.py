@@ -2614,14 +2614,74 @@ def handle_voice(message: types.Message):
                 bot.reply_to(message, f"Failed to send: {e}")
             return
 
-    # 2) Admin test/practice: only when admin sends voice directly in their own bot DM (not work chat)
+    # 2) Admin test/practice OR forwarded student message: voice directly in admin chat
     is_admin_chat = chat_id == ADMIN_FEEDBACK_CHAT_ID
     is_reply_to_student = message.reply_to_message and (
         getattr(message.reply_to_message, "forward_from", None)
         or _student_reply_map.get(message.reply_to_message.message_id)
     )
     if is_admin_chat and from_id in ADMIN_IDS and not is_reply_to_student:
-        level_label = "Practice (forwarded)" if (getattr(message, "forward_from", None) or getattr(message, "forward_date", None)) else "Test"
+        # Check if this is a forwarded student message
+        fwd_from = getattr(message, "forward_from", None)
+        if fwd_from:
+            # This is a forwarded student message - treat it like a real submission
+            student_chat_id = fwd_from.id
+            temp_path = None
+            try:
+                file_info = bot.get_file(message.voice.file_id)
+                downloaded_file = bot.download_file(file_info.file_path)
+                temp_path = os.path.join(_BOT_DIR, "temp_reply.ogg")
+                with open(temp_path, "wb") as f:
+                    f.write(downloaded_file)
+
+                # Get student's actual level and task number
+                ws = get_students_worksheet()
+                records = ws.get_all_records()
+                level = "Unknown"
+                for row in records:
+                    if str(row.get("Chat ID")) == str(student_chat_id):
+                        level = row.get("Level", "Unknown")
+                        break
+
+                transcript = _transcribe_audio(temp_path)
+
+                # Get task context
+                _, total_tasks_sent = get_student_level_and_total_tasks(student_chat_id)
+                task_script = get_task_script(level, total_tasks_sent) if total_tasks_sent else ""
+                example_answers = get_task_example_answers(level, total_tasks_sent) if total_tasks_sent else ""
+                
+                print(f"[Forwarded] student_id={student_chat_id} level={level} task#={total_tasks_sent}")
+                print(f"[Forwarded] script_found={bool(task_script)} examples_found={bool(example_answers)}")
+
+                # Generate advanced feedback
+                ai_draft, scores = _run_draft_feedback_and_score(transcript, level, task_script, example_answers)
+                
+                transcript_msg = (
+                    f"🔄 Forwarded student voice\n"
+                    f"Student Chat ID: <code>{student_chat_id}</code> | Level: <b>{level}</b> | Task: <b>{total_tasks_sent}</b>\n\n"
+                    f"Transcript:\n{transcript}"
+                )
+                bot.send_message(ADMIN_FEEDBACK_CHAT_ID, transcript_msg)
+                bot.send_message(ADMIN_FEEDBACK_CHAT_ID, ai_draft)
+                
+                # Log to task log
+                try:
+                    update_task_log_reply(student_chat_id, transcript, scores)
+                except Exception as e:
+                    print(f"Failed to log forwarded submission: {e}")
+            except Exception as e:
+                print(f"Forwarded voice error: {e}")
+                bot.send_message(ADMIN_FEEDBACK_CHAT_ID, f"⚠️ Error processing forwarded voice: {e}")
+            finally:
+                if temp_path and os.path.exists(temp_path):
+                    try:
+                        os.remove(temp_path)
+                    except OSError:
+                        pass
+            return
+        
+        # Otherwise it's a test/practice message from admin
+        level_label = "Practice (forwarded)" if getattr(message, "forward_date", None) else "Test"
         temp_path = None
         try:
             file_info = bot.get_file(message.voice.file_id)
