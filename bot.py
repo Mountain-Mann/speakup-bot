@@ -960,6 +960,21 @@ print(f"Level channels: {LEVEL_CHANNELS}")
 # works even when Telegram hides forward_from due to privacy settings.
 _student_reply_map: dict = {}
 
+# Stores pending practice exercise answers keyed by chat_id
+_practice_state: dict = {}
+
+# Stores pending /messageall targets keyed by admin user_id
+_messageall_state: dict = {}
+
+# In-memory activity log (last 50 entries)
+_bot_logs: list = []
+
+def _add_log(entry: str):
+    now = _now_moscow().strftime("%Y-%m-%d %H:%M")
+    _bot_logs.append(f"[{now}] {entry}")
+    if len(_bot_logs) > 50:
+        _bot_logs.pop(0)
+
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
@@ -977,6 +992,11 @@ def _level_keyboard():
 def handle_start(message: types.Message):
     chat_id = message.chat.id
     clear_registration_state(chat_id)
+    # Handle referral code: /start ref_XXXXXXXX
+    parts = message.text.strip().split()
+    if len(parts) == 2 and parts[1].startswith("ref_"):
+        referral_code = parts[1][4:]
+        _process_referral_join(chat_id, referral_code)
     bot.reply_to(
         message,
         "👋 Welcome! Tap your <b>level</b> to get started:",
@@ -1440,6 +1460,829 @@ def handle_progress(message: types.Message):
 
 
 # =======================
+# COMMAND: /stats
+# =======================
+@bot.message_handler(commands=["stats"])
+def handle_stats(message: types.Message):
+    chat_id = message.chat.id
+    if is_maintenance_mode() and not is_admin(chat_id):
+        bot.send_message(chat_id, "🔧 Bot is currently under maintenance. Please try again later.")
+        return
+    try:
+        text, markup = _def_format_stats(chat_id, "all")
+        bot.send_message(chat_id, text, reply_markup=markup)
+    except Exception as e:
+        bot.send_message(chat_id, f"Could not load stats right now. Please try again later. ({e})")
+
+
+@bot.callback_query_handler(func=lambda c: c.data and c.data.startswith("stats_"))
+def handle_stats_callback(callback: types.CallbackQuery):
+    chat_id = callback.message.chat.id
+    period = callback.data.replace("stats_", "")
+    bot.answer_callback_query(callback.id)
+    try:
+        text, markup = _def_format_stats(chat_id, period)
+        bot.edit_message_text(text, chat_id, callback.message.message_id, reply_markup=markup)
+    except Exception as e:
+        bot.answer_callback_query(callback.id, f"Error: {e}", show_alert=True)
+
+
+# =======================
+# COMMAND: /vocabulary
+# =======================
+@bot.message_handler(commands=["vocabulary"])
+def handle_vocabulary(message: types.Message):
+    chat_id = message.chat.id
+    if is_maintenance_mode() and not is_admin(chat_id):
+        bot.send_message(chat_id, "🔧 Bot is currently under maintenance.")
+        return
+    settings = get_student_settings(chat_id)
+    lang = settings.get("Language", "en")
+    level, _ = get_student_level_and_total_tasks(chat_id)
+
+    rows = get_student_task_log(chat_id)
+    replied = [r for r in rows if r.get("Reply Received")][-10:]
+    scores = {}
+    for skill in ["Grammar", "Vocabulary", "Fluency"]:
+        vals = _def_scores(replied, skill)
+        scores[skill] = round(sum(vals) / len(vals), 1) if vals else 0.0
+    weak = [k for k, v in scores.items() if v > 0 and v < 3.5]
+
+    wait_msg = bot.send_message(chat_id, "🎯 Generating flashcards..." if lang == "en" else "🎯 Генерирую карточки словарного запаса...")
+    cards = _generate_vocabulary_flashcards(level, weak)
+    try:
+        bot.delete_message(chat_id, wait_msg.message_id)
+    except Exception:
+        pass
+
+    if not cards:
+        bot.send_message(chat_id, "Could not generate flashcards right now. Please try again later.")
+        return
+
+    if lang == "ru":
+        text = f"🎯 <b>Карточки словарного запаса — уровень {level}</b>\n\n"
+        for i, c in enumerate(cards, 1):
+            synonyms = c.get("synonyms", [])
+            syn_str = f"\n🔄 <i>Синонимы: {', '.join(synonyms)}</i>" if synonyms else ""
+            text += (
+                f"<b>{i}. {c.get('word', '')}</b>\n"
+                f"📖 {c.get('definition', '')}\n"
+                f"💬 <i>{c.get('example', '')}</i>{syn_str}\n\n"
+            )
+    else:
+        text = f"🎯 <b>Vocabulary Flashcards — {level} Level</b>\n\n"
+        for i, c in enumerate(cards, 1):
+            synonyms = c.get("synonyms", [])
+            syn_str = f"\n🔄 <i>Synonyms: {', '.join(synonyms)}</i>" if synonyms else ""
+            text += (
+                f"<b>{i}. {c.get('word', '')}</b> ({c.get('part_of_speech', c.get('category', ''))})\n"
+                f"📖 {c.get('definition', '')}\n"
+                f"💬 <i>{c.get('example', '')}</i>{syn_str}\n\n"
+            )
+
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton(
+        "🔄 New Cards" if lang == "en" else "🔄 Новые карточки",
+        callback_data="vocab_refresh"
+    ))
+    bot.send_message(chat_id, text, reply_markup=markup)
+    _add_log(f"vocab: chat_id={chat_id} level={level}")
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "vocab_refresh")
+def handle_vocab_refresh(callback: types.CallbackQuery):
+    bot.answer_callback_query(callback.id)
+    handle_vocabulary(callback.message)
+
+
+# =======================
+# COMMAND: /tips
+# =======================
+@bot.message_handler(commands=["tips"])
+def handle_tips(message: types.Message):
+    chat_id = message.chat.id
+    if is_maintenance_mode() and not is_admin(chat_id):
+        bot.send_message(chat_id, "🔧 Bot is currently under maintenance.")
+        return
+    settings = get_student_settings(chat_id)
+    lang = settings.get("Language", "en")
+    level, _ = get_student_level_and_total_tasks(chat_id)
+
+    wait_msg = bot.send_message(chat_id, "💡 Analyzing your progress..." if lang == "en" else "💡 Анализирую ваш прогресс...")
+
+    rows = get_student_task_log(chat_id)
+    replied = [r for r in rows if r.get("Reply Received")][-10:]
+    transcripts = [r.get("Transcript", "") for r in replied if r.get("Transcript")]
+    scores = {}
+    for skill in ["Pronunciation", "Grammar", "Vocabulary", "Fluency"]:
+        vals = _def_scores(replied, skill)
+        scores[skill] = round(sum(vals) / len(vals), 1) if vals else 0.0
+
+    tips = _generate_personalized_tips(transcripts, scores, level)
+    try:
+        bot.delete_message(chat_id, wait_msg.message_id)
+    except Exception:
+        pass
+
+    if lang == "ru":
+        header = f"💡 <b>Персональные советы по изучению (уровень {level})</b>\n\n"
+    else:
+        header = f"💡 <b>Personalized Study Tips ({level} level)</b>\n\n"
+    bot.send_message(chat_id, header + tips)
+    _add_log(f"tips: chat_id={chat_id} level={level}")
+
+
+# =======================
+# COMMAND: /practice
+# =======================
+@bot.message_handler(commands=["practice"])
+def handle_practice(message: types.Message):
+    chat_id = message.chat.id
+    if is_maintenance_mode() and not is_admin(chat_id):
+        bot.send_message(chat_id, "🔧 Bot is currently under maintenance.")
+        return
+    settings = get_student_settings(chat_id)
+    lang = settings.get("Language", "en")
+    level, _ = get_student_level_and_total_tasks(chat_id)
+
+    rows = get_student_task_log(chat_id)
+    replied = [r for r in rows if r.get("Reply Received")][-10:]
+    scores = {}
+    for skill in ["Grammar", "Vocabulary", "Fluency"]:
+        vals = _def_scores(replied, skill)
+        scores[skill] = round(sum(vals) / len(vals), 1) if vals else 0.0
+    weak = [k for k, v in scores.items() if v > 0 and v < 3.5]
+
+    wait_msg = bot.send_message(chat_id, "✍️ Generating exercise..." if lang == "en" else "✍️ Генерирую упражнение...")
+    exercise = _generate_practice_exercise(level, weak)
+    try:
+        bot.delete_message(chat_id, wait_msg.message_id)
+    except Exception:
+        pass
+
+    if exercise.get("type") == "error":
+        bot.send_message(chat_id, exercise.get("content", "Could not generate exercise."))
+        return
+
+    if lang == "ru":
+        text = (
+            f"✍️ <b>Упражнение ({exercise.get('skill_focus', 'Grammar')})</b>\n\n"
+            f"{exercise.get('exercise', '')}\n\n"
+            f"<i>Сложность: {exercise.get('difficulty', 'medium')}</i>"
+        )
+        show_btn = "👁 Показать ответ"
+        new_btn = "🔄 Новое упражнение"
+    else:
+        text = (
+            f"✍️ <b>Practice Exercise ({exercise.get('skill_focus', 'Grammar')})</b>\n\n"
+            f"{exercise.get('exercise', '')}\n\n"
+            f"<i>Difficulty: {exercise.get('difficulty', 'medium')}</i>"
+        )
+        show_btn = "👁 Show Answer"
+        new_btn = "🔄 New Exercise"
+
+    _practice_state[chat_id] = {
+        "answer": exercise.get("correct_answer", ""),
+        "explanation": exercise.get("explanation", ""),
+        "lang": lang,
+    }
+
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton(show_btn, callback_data="practice_answer"),
+        types.InlineKeyboardButton(new_btn, callback_data="practice_new"),
+    )
+    bot.send_message(chat_id, text, reply_markup=markup)
+    _add_log(f"practice: chat_id={chat_id} level={level} weak={weak}")
+
+
+@bot.callback_query_handler(func=lambda c: c.data in ("practice_answer", "practice_new"))
+def handle_practice_callback(callback: types.CallbackQuery):
+    chat_id = callback.message.chat.id
+    bot.answer_callback_query(callback.id)
+
+    if callback.data == "practice_answer":
+        state = _practice_state.get(chat_id)
+        if not state:
+            bot.answer_callback_query(callback.id, "Session expired. Use /practice for a new exercise.", show_alert=True)
+            return
+        lang = state.get("lang", "en")
+        if lang == "ru":
+            text = f"✅ <b>Ответ:</b> {state['answer']}\n\n💡 <b>Объяснение:</b> {state['explanation']}"
+        else:
+            text = f"✅ <b>Answer:</b> {state['answer']}\n\n💡 <b>Explanation:</b> {state['explanation']}"
+        new_btn = "🔄 Новое упражнение" if lang == "ru" else "🔄 New Exercise"
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton(new_btn, callback_data="practice_new"))
+        bot.edit_message_text(
+            callback.message.text + f"\n\n{text}",
+            chat_id, callback.message.message_id, reply_markup=markup
+        )
+    else:
+        # Trigger a new exercise as if sending /practice
+        class _FakeMsg:
+            def __init__(self, cid):
+                self.chat = type("C", (), {"id": cid})()
+                self.text = "/practice"
+                self.from_user = type("U", (), {"id": cid})()
+                self.content_type = "text"
+        handle_practice(_FakeMsg(chat_id))
+
+
+# =======================
+# COMMAND: /dictionary
+# =======================
+@bot.message_handler(commands=["dictionary"])
+def handle_dictionary(message: types.Message):
+    chat_id = message.chat.id
+    if is_maintenance_mode() and not is_admin(chat_id):
+        bot.send_message(chat_id, "🔧 Bot is currently under maintenance.")
+        return
+    parts = message.text.strip().split(maxsplit=1)
+    if len(parts) < 2:
+        bot.reply_to(message, "Usage: <code>/dictionary [word]</code>\nExample: <code>/dictionary perseverance</code>")
+        return
+
+    word = parts[1].strip()
+    settings = get_student_settings(chat_id)
+    lang = settings.get("Language", "en")
+    level, _ = get_student_level_and_total_tasks(chat_id)
+
+    wait_msg = bot.send_message(chat_id, f"📖 Looking up '{word}'...")
+    result = _lookup_word(word, level)
+    try:
+        bot.delete_message(chat_id, wait_msg.message_id)
+    except Exception:
+        pass
+
+    examples = result.get("examples", [])
+    synonyms = result.get("synonyms", [])
+    if isinstance(synonyms, list):
+        synonyms = [str(s) for s in synonyms]
+
+    if lang == "ru":
+        text = f"📖 <b>{word}</b> ({result.get('part_of_speech', '')})\n\n<b>Определение:</b> {result.get('definition', '')}\n"
+        if examples:
+            text += "\n<b>Примеры:</b>\n" + "\n".join(f"• <i>{ex}</i>" for ex in examples)
+        if synonyms:
+            text += f"\n\n<b>Синонимы:</b> {', '.join(synonyms)}"
+    else:
+        text = f"📖 <b>{word}</b> ({result.get('part_of_speech', '')})\n\n<b>Definition:</b> {result.get('definition', '')}\n"
+        if examples:
+            text += "\n<b>Examples:</b>\n" + "\n".join(f"• <i>{ex}</i>" for ex in examples)
+        if synonyms:
+            text += f"\n\n<b>Synonyms:</b> {', '.join(synonyms)}"
+
+    bot.send_message(chat_id, text)
+    _add_log(f"dictionary: chat_id={chat_id} word={word}")
+
+
+# =======================
+# COMMAND: /examples
+# =======================
+@bot.message_handler(commands=["examples"])
+def handle_examples(message: types.Message):
+    chat_id = message.chat.id
+    if is_maintenance_mode() and not is_admin(chat_id):
+        bot.send_message(chat_id, "🔧 Bot is currently under maintenance.")
+        return
+    parts = message.text.strip().split(maxsplit=1)
+    if len(parts) < 2:
+        bot.reply_to(message, "Usage: <code>/examples [grammar point]</code>\nExample: <code>/examples present continuous</code>")
+        return
+
+    grammar_point = parts[1].strip()
+    settings = get_student_settings(chat_id)
+    lang = settings.get("Language", "en")
+    level, _ = get_student_level_and_total_tasks(chat_id)
+
+    wait_msg = bot.send_message(chat_id, f"📝 Generating examples for '{grammar_point}'...")
+    raw = _generate_grammar_examples(grammar_point, level)
+    try:
+        bot.delete_message(chat_id, wait_msg.message_id)
+    except Exception:
+        pass
+
+    # Normalize to list of strings
+    if isinstance(raw, dict):
+        examples = raw.get("examples", raw.get("sentences", [str(raw)]))
+    elif isinstance(raw, list):
+        examples = [e.get("sentence", str(e)) if isinstance(e, dict) else str(e) for e in raw]
+    else:
+        examples = [str(raw)]
+
+    if lang == "ru":
+        header = f"📝 <b>Примеры: {grammar_point}</b>\n\n"
+    else:
+        header = f"📝 <b>Examples: {grammar_point}</b>\n\n"
+
+    text = header + "\n".join(f"{i+1}. <i>{ex}</i>" for i, ex in enumerate(examples))
+    bot.send_message(chat_id, text)
+    _add_log(f"examples: chat_id={chat_id} grammar={grammar_point}")
+
+
+# =======================
+# COMMAND: /referral
+# =======================
+@bot.message_handler(commands=["referral"])
+def handle_referral(message: types.Message):
+    chat_id = message.chat.id
+    if is_maintenance_mode() and not is_admin(chat_id):
+        bot.send_message(chat_id, "🔧 Bot is currently under maintenance.")
+        return
+    settings = get_student_settings(chat_id)
+    lang = settings.get("Language", "en")
+    stats = _get_referral_stats(chat_id)
+
+    code = stats["code"]
+    count = int(stats["count"] or 0)
+    threshold = stats["reward_threshold"]
+    remaining = max(0, threshold - count)
+
+    try:
+        bot_username = bot.get_me().username
+        link = f"https://t.me/{bot_username}?start=ref_{code}"
+    except Exception:
+        link = f"Code: <code>{code}</code>"
+
+    if lang == "ru":
+        text = (
+            f"🔗 <b>Ваша реферальная ссылка</b>\n\n"
+            f"Пригласите друзей и получите вознаграждение!\n\n"
+            f"<b>Ссылка:</b> {link}\n"
+            f"<b>Код:</b> <code>{code}</code>\n"
+            f"<b>Приглашено друзей:</b> {count}\n\n"
+        )
+        if count >= threshold:
+            text += "🎉 Вы заработали бесплатный месяц! Свяжитесь с учителем для активации."
+        else:
+            text += f"Пригласите ещё {remaining} {'друга' if remaining == 1 else 'друзей'} и получите <b>бесплатный месяц!</b>"
+    else:
+        text = (
+            f"🔗 <b>Your Referral Link</b>\n\n"
+            f"Invite friends and earn rewards!\n\n"
+            f"<b>Link:</b> {link}\n"
+            f"<b>Code:</b> <code>{code}</code>\n"
+            f"<b>Friends referred:</b> {count}\n\n"
+        )
+        if count >= threshold:
+            text += "🎉 You've earned a free month! Contact your teacher to claim it."
+        else:
+            text += f"Refer {remaining} more friend{'s' if remaining != 1 else ''} to earn a <b>free month!</b>"
+
+    bot.send_message(chat_id, text)
+
+
+# =======================
+# COMMANDS: Admin Student Management
+# =======================
+@bot.message_handler(commands=["liststudents"])
+def handle_liststudents(message: types.Message):
+    if not is_admin(message.from_user.id):
+        return
+    ws = get_students_worksheet()
+    all_students = ws.get_all_records()
+    if not all_students:
+        bot.reply_to(message, "No students found.")
+        return
+
+    by_level: dict = {}
+    for student in all_students:
+        level = str(student.get("Level", "") or "Unknown").strip() or "Unknown"
+        by_level.setdefault(level, []).append(student)
+
+    text = "👥 <b>All Students</b>\n\n"
+    for level in sorted(by_level.keys()):
+        students_in_level = by_level[level]
+        text += f"<b>{level}</b> ({len(students_in_level)}):\n"
+        for s in students_in_level:
+            name = str(s.get("Name", "") or "Unknown").strip() or "Unknown"
+            cid = s.get("Chat ID", "")
+            text += f"  • {name} — <code>{cid}</code>\n"
+        text += "\n"
+
+    bot.reply_to(message, text)
+    _add_log(f"liststudents: admin={message.from_user.id}")
+
+
+@bot.message_handler(commands=["studentinfo"])
+def handle_studentinfo(message: types.Message):
+    if not is_admin(message.from_user.id):
+        return
+    parts = message.text.strip().split()
+    if len(parts) != 2:
+        bot.reply_to(message, "Usage: <code>/studentinfo &lt;chat_id&gt;</code>")
+        return
+    try:
+        target_chat_id = int(parts[1])
+    except ValueError:
+        bot.reply_to(message, "chat_id must be a number.")
+        return
+
+    row = get_student_row(target_chat_id)
+    if not row:
+        bot.reply_to(message, f"Student <code>{target_chat_id}</code> not found.")
+        return
+
+    settings = get_student_settings(target_chat_id)
+    task_rows = get_student_task_log(target_chat_id)
+    replied = [r for r in task_rows if r.get("Reply Received")]
+    reply_rate = round(len(replied) / len(task_rows) * 100) if task_rows else 0
+
+    text = (
+        f"👤 <b>Student Profile</b>\n\n"
+        f"<b>Name:</b> {row.get('Name', 'N/A')}\n"
+        f"<b>Chat ID:</b> <code>{target_chat_id}</code>\n"
+        f"<b>Level:</b> {row.get('Level', 'N/A')}\n"
+        f"<b>Handle:</b> {row.get('Telegram Handle', 'N/A')}\n"
+        f"<b>Phone:</b> {row.get('Telephone', 'N/A')}\n"
+        f"<b>Tier End Date:</b> {row.get('Tier End Date', 'N/A')}\n"
+        f"<b>Balance Due:</b> {row.get('Balance Due', 'N/A')}\n\n"
+        f"<b>Tasks Sent:</b> {len(task_rows)}\n"
+        f"<b>Tasks Replied:</b> {len(replied)} ({reply_rate}%)\n"
+        f"<b>Language:</b> {settings.get('Language', 'en')}\n"
+        f"<b>Status:</b> {settings.get('Status', 'active')}\n"
+        f"<b>Notes:</b> {row.get('Notes', 'None') or 'None'}"
+    )
+
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton("📊 Full Progress", callback_data=f"adminprog_{target_chat_id}"),
+        types.InlineKeyboardButton("🚫 Suspend", callback_data=f"adminsuspend_{target_chat_id}"),
+    )
+    bot.reply_to(message, text, reply_markup=markup)
+    _add_log(f"studentinfo: admin={message.from_user.id} target={target_chat_id}")
+
+
+@bot.callback_query_handler(func=lambda c: c.data and (c.data.startswith("adminprog_") or c.data.startswith("adminsuspend_")))
+def handle_admin_student_actions(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        bot.answer_callback_query(callback.id, "Not authorized.", show_alert=True)
+        return
+    bot.answer_callback_query(callback.id)
+    data = callback.data
+
+    if data.startswith("adminprog_"):
+        target_chat_id = int(data.replace("adminprog_", ""))
+        try:
+            text = _def_format_progress(target_chat_id)
+            bot.send_message(callback.message.chat.id, f"📊 Progress for <code>{target_chat_id}</code>:\n\n{text}")
+        except Exception as e:
+            bot.send_message(callback.message.chat.id, f"Could not load progress: {e}")
+
+    elif data.startswith("adminsuspend_"):
+        target_chat_id = int(data.replace("adminsuspend_", ""))
+        update_student_setting(target_chat_id, "Status", "suspended")
+        name = get_student_name(target_chat_id)
+        bot.send_message(callback.message.chat.id, f"🚫 <b>{name}</b> (<code>{target_chat_id}</code>) suspended.")
+        try:
+            bot.send_message(target_chat_id, "⚠️ Your account has been temporarily suspended. Please contact your teacher.")
+        except Exception:
+            pass
+        _add_log(f"suspend: admin={callback.from_user.id} target={target_chat_id}")
+
+
+@bot.message_handler(commands=["suspend"])
+def handle_suspend(message: types.Message):
+    if not is_admin(message.from_user.id):
+        return
+    parts = message.text.strip().split()
+    if len(parts) != 2:
+        bot.reply_to(message, "Usage: <code>/suspend &lt;chat_id&gt;</code>")
+        return
+    try:
+        target_chat_id = int(parts[1])
+    except ValueError:
+        bot.reply_to(message, "chat_id must be a number.")
+        return
+    update_student_setting(target_chat_id, "Status", "suspended")
+    name = get_student_name(target_chat_id)
+    bot.reply_to(message, f"🚫 <b>{name}</b> (<code>{target_chat_id}</code>) has been suspended.")
+    try:
+        bot.send_message(target_chat_id, "⚠️ Your account has been temporarily suspended. Please contact your teacher.")
+    except Exception as e:
+        bot.reply_to(message, f"Note: Could not notify student: {e}")
+    _add_log(f"suspend: admin={message.from_user.id} target={target_chat_id}")
+
+
+@bot.message_handler(commands=["unsuspend"])
+def handle_unsuspend(message: types.Message):
+    if not is_admin(message.from_user.id):
+        return
+    parts = message.text.strip().split()
+    if len(parts) != 2:
+        bot.reply_to(message, "Usage: <code>/unsuspend &lt;chat_id&gt;</code>")
+        return
+    try:
+        target_chat_id = int(parts[1])
+    except ValueError:
+        bot.reply_to(message, "chat_id must be a number.")
+        return
+    update_student_setting(target_chat_id, "Status", "active")
+    name = get_student_name(target_chat_id)
+    bot.reply_to(message, f"✅ <b>{name}</b> (<code>{target_chat_id}</code>) has been unsuspended.")
+    try:
+        bot.send_message(target_chat_id, "✅ Your account has been reactivated! Welcome back.")
+    except Exception as e:
+        bot.reply_to(message, f"Note: Could not notify student: {e}")
+    _add_log(f"unsuspend: admin={message.from_user.id} target={target_chat_id}")
+
+
+@bot.message_handler(commands=["messageall"])
+def handle_messageall(message: types.Message):
+    if not is_admin(message.from_user.id):
+        return
+    parts = message.text.strip().split(maxsplit=2)
+    if len(parts) < 3:
+        bot.reply_to(message, "Usage: <code>/messageall &lt;level|all&gt; &lt;message&gt;</code>\nExample: <code>/messageall A2 Class is cancelled today.</code>")
+        return
+
+    level_target = parts[1].strip().upper()
+    broadcast_text = parts[2].strip()
+
+    if level_target != "ALL" and level_target not in LEVEL_CHANNELS:
+        bot.reply_to(message, f"Invalid level. Use: {', '.join(LEVEL_CHANNELS.keys())} or ALL")
+        return
+
+    if level_target == "ALL":
+        recipients = _def_all_student_chat_ids()
+    else:
+        recipients = get_students_by_level(level_target)
+
+    sent = 0
+    failed = 0
+    for cid in recipients:
+        try:
+            bot.send_message(cid, f"📢 <b>Message from SpeakUp:</b>\n\n{broadcast_text}")
+            sent += 1
+        except Exception:
+            failed += 1
+
+    bot.reply_to(message, f"📢 Broadcast complete.\n✅ Sent: {sent} | ❌ Failed: {failed}")
+    _add_log(f"messageall: admin={message.from_user.id} level={level_target} sent={sent}")
+
+
+@bot.message_handler(commands=["kick"])
+def handle_kick(message: types.Message):
+    if not is_admin(message.from_user.id):
+        return
+    parts = message.text.strip().split()
+    if len(parts) != 2:
+        bot.reply_to(message, "Usage: <code>/kick &lt;chat_id&gt;</code>")
+        return
+    try:
+        target_chat_id = int(parts[1])
+    except ValueError:
+        bot.reply_to(message, "chat_id must be a number.")
+        return
+
+    name = get_student_name(target_chat_id)
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton("✅ Confirm", callback_data=f"kickconfirm_{target_chat_id}"),
+        types.InlineKeyboardButton("❌ Cancel", callback_data="kickcancel"),
+    )
+    bot.reply_to(
+        message,
+        f"⚠️ Remove <b>{name}</b> (<code>{target_chat_id}</code>) from the system?\n\nThis deletes their Students sheet entry.",
+        reply_markup=markup
+    )
+
+
+@bot.callback_query_handler(func=lambda c: c.data and (c.data.startswith("kickconfirm_") or c.data == "kickcancel"))
+def handle_kick_callback(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        bot.answer_callback_query(callback.id, "Not authorized.", show_alert=True)
+        return
+    bot.answer_callback_query(callback.id)
+    if callback.data == "kickcancel":
+        bot.edit_message_text("Kick cancelled.", callback.message.chat.id, callback.message.message_id)
+        return
+
+    target_chat_id = int(callback.data.replace("kickconfirm_", ""))
+    name = get_student_name(target_chat_id)
+    try:
+        ws = get_students_worksheet()
+        all_values = ws.get_all_values()
+        headers = all_values[0]
+        chat_id_col = headers.index("Chat ID")
+        for i, row in enumerate(all_values[1:], start=2):
+            if chat_id_col < len(row) and str(row[chat_id_col]).strip() == str(target_chat_id):
+                ws.delete_rows(i)
+                break
+        bot.edit_message_text(f"✅ <b>{name}</b> (<code>{target_chat_id}</code>) removed from the system.", callback.message.chat.id, callback.message.message_id)
+        _add_log(f"kick: admin={callback.from_user.id} target={target_chat_id}")
+    except Exception as e:
+        bot.edit_message_text(f"❌ Could not remove student: {e}", callback.message.chat.id, callback.message.message_id)
+
+
+# =======================
+# COMMANDS: Admin Analytics
+# =======================
+@bot.message_handler(commands=["analytics"])
+def handle_analytics(message: types.Message):
+    if not is_admin(message.from_user.id):
+        return
+    wait_msg = bot.reply_to(message, "📊 Loading analytics...")
+    data = _get_analytics_data()
+    try:
+        bot.delete_message(message.chat.id, wait_msg.message_id)
+    except Exception:
+        pass
+
+    level_dist = "\n".join([f"  {k}: {v}" for k, v in sorted(data["level_distribution"].items())]) or "  No data"
+    now = _now_moscow()
+
+    text = (
+        f"📊 <b>SpeakUp Analytics</b>\n"
+        f"<i>{now.strftime('%Y-%m-%d %H:%M')} Moscow</i>\n\n"
+        f"<b>👥 Students:</b>\n"
+        f"  Total: {data['total_students']} | Active: {data['active_students']}\n\n"
+        f"<b>📚 Level Distribution:</b>\n{level_dist}\n\n"
+        f"<b>📋 All Time:</b>\n"
+        f"  Tasks Sent: {data['total_tasks']} | Replied: {data['total_replies']}\n"
+        f"  Completion Rate: {data['completion_rate']}%\n\n"
+        f"<b>📅 Last 30 Days:</b>\n"
+        f"  Tasks Sent: {data['recent_tasks']} | Replied: {data['recent_replies']}\n\n"
+        f"<b>🌐 Languages:</b>\n"
+        f"  English: {data['language_stats'].get('en', 0)} | Russian: {data['language_stats'].get('ru', 0)}"
+    )
+    bot.reply_to(message, text)
+    _add_log(f"analytics: admin={message.from_user.id}")
+
+
+@bot.message_handler(commands=["report"])
+def handle_report(message: types.Message):
+    if not is_admin(message.from_user.id):
+        return
+    parts = message.text.strip().split()
+    if len(parts) != 2:
+        bot.reply_to(message, "Usage: <code>/report &lt;chat_id&gt;</code>")
+        return
+    try:
+        target_chat_id = int(parts[1])
+    except ValueError:
+        bot.reply_to(message, "chat_id must be a number.")
+        return
+
+    name = get_student_name(target_chat_id)
+    try:
+        progress = _def_format_progress(target_chat_id)
+        row = get_student_row(target_chat_id)
+        header = (
+            f"📄 <b>Full Report — {name}</b>\n"
+            f"Chat ID: <code>{target_chat_id}</code>\n"
+            f"Level: {row.get('Level', 'N/A') if row else 'N/A'}\n"
+            f"Tier End: {row.get('Tier End Date', 'N/A') if row else 'N/A'}\n"
+            f"Balance Due: {row.get('Balance Due', 'N/A') if row else 'N/A'}\n\n"
+        )
+        bot.reply_to(message, header + progress)
+    except Exception as e:
+        bot.reply_to(message, f"Could not generate report: {e}")
+    _add_log(f"report: admin={message.from_user.id} target={target_chat_id}")
+
+
+@bot.message_handler(commands=["inactive"])
+def handle_inactive(message: types.Message):
+    if not is_admin(message.from_user.id):
+        return
+    parts = message.text.strip().split()
+    days = 7
+    if len(parts) == 2:
+        try:
+            days = int(parts[1])
+        except ValueError:
+            bot.reply_to(message, "Usage: <code>/inactive [days]</code> (default: 7)")
+            return
+
+    now = _now_moscow()
+    cutoff = now - timedelta(days=days)
+
+    task_ws = get_task_log_worksheet()
+    all_tasks = task_ws.get_all_records()
+
+    last_reply: dict = {}
+    for task in all_tasks:
+        reply_date = task.get("Reply Received", "")
+        cid = str(task.get("Chat ID", "")).strip()
+        if not cid or not reply_date:
+            continue
+        try:
+            dt = datetime.strptime(reply_date[:16], "%Y-%m-%d %H:%M")
+            if cid not in last_reply or dt > last_reply[cid]:
+                last_reply[cid] = dt
+        except (ValueError, KeyError):
+            continue
+
+    ws = get_students_worksheet()
+    inactive = []
+    for row in ws.get_all_records():
+        cid_str = str(row.get("Chat ID", "") or "").strip()
+        if not cid_str:
+            continue
+        last_dt = last_reply.get(cid_str)
+        if last_dt is None or last_dt < cutoff:
+            days_ago = (now - last_dt).days if last_dt else 999
+            inactive.append((str(row.get("Name", "Unknown") or "Unknown"), cid_str, days_ago))
+
+    if not inactive:
+        bot.reply_to(message, f"✅ All students replied within the last {days} days!")
+        return
+
+    text = f"⚠️ <b>Inactive Students ({days}+ days)</b>\n\n"
+    for name, cid, d in sorted(inactive, key=lambda x: x[2], reverse=True):
+        d_str = f"{d}d" if d < 999 else "never replied"
+        text += f"• <b>{name}</b> (<code>{cid}</code>) — {d_str}\n"
+    bot.reply_to(message, text)
+    _add_log(f"inactive: admin={message.from_user.id} days={days} found={len(inactive)}")
+
+
+# =======================
+# COMMANDS: Admin Utilities
+# =======================
+@bot.message_handler(commands=["preview"])
+def handle_preview(message: types.Message):
+    if not is_admin(message.from_user.id):
+        return
+    parts = message.text.strip().split()
+    if len(parts) != 3:
+        bot.reply_to(message, "Usage: <code>/preview &lt;level&gt; &lt;task_number&gt;</code>\nExample: <code>/preview A2 5</code>")
+        return
+    level = parts[1].strip().upper()
+    channel_id = LEVEL_CHANNELS.get(level)
+    if not channel_id:
+        bot.reply_to(message, f"Unknown level. Use: {', '.join(LEVEL_CHANNELS.keys())}")
+        return
+    try:
+        task_num = int(parts[2])
+    except ValueError:
+        bot.reply_to(message, "Task number must be an integer.")
+        return
+
+    message_id = get_channel_message_id_for_task(level, task_num)
+    if message_id is None:
+        bot.reply_to(message, f"Task #{task_num} not found in {level} Task List.")
+        return
+
+    script = get_task_script(level, task_num)
+    bot.reply_to(message, f"👁 <b>Preview: {level} Task #{task_num}</b>")
+    try:
+        bot.forward_message(message.chat.id, channel_id, message_id)
+        if script:
+            bot.send_message(message.chat.id, f"📝 <b>Script text:</b>\n\n{script}")
+        else:
+            bot.send_message(message.chat.id, "⚠️ No script text found for this task.")
+    except Exception as e:
+        bot.reply_to(message, f"Could not forward: {e}")
+    _add_log(f"preview: admin={message.from_user.id} level={level} task={task_num}")
+
+
+@bot.message_handler(commands=["test"])
+def handle_test(message: types.Message):
+    if not is_admin(message.from_user.id):
+        return
+    results = []
+    test_msg = "🧪 SpeakUp bot connection test"
+
+    for label, cid in [("Admin DM", ADMIN_FEEDBACK_CHAT_ID), ("Work Chat", WORK_CHAT_ID), ("Partner DM", PARTNER_CHAT_ID)]:
+        try:
+            bot.send_message(cid, test_msg)
+            results.append(f"✅ {label} (<code>{cid}</code>)")
+        except Exception as e:
+            results.append(f"❌ {label}: {e}")
+
+    bot.reply_to(message, "🧪 <b>Connection Test:</b>\n\n" + "\n".join(results))
+    _add_log(f"test: admin={message.from_user.id}")
+
+
+@bot.message_handler(commands=["logs"])
+def handle_logs(message: types.Message):
+    if not is_admin(message.from_user.id):
+        return
+    if not _bot_logs:
+        bot.reply_to(message, "📝 No activity logged yet.")
+        return
+    recent = _bot_logs[-20:]
+    text = "📝 <b>Recent Activity (last 20)</b>\n\n" + "\n".join(recent)
+    bot.reply_to(message, text)
+
+
+@bot.message_handler(commands=["maintenance"])
+def handle_maintenance(message: types.Message):
+    if not is_admin(message.from_user.id):
+        return
+    parts = message.text.strip().split()
+    if len(parts) != 2 or parts[1].lower() not in ("on", "off"):
+        bot.reply_to(message, "Usage: <code>/maintenance on</code> or <code>/maintenance off</code>")
+        return
+    enabled = parts[1].lower() == "on"
+    set_maintenance_mode(enabled)
+    status = "ON 🔧" if enabled else "OFF ✅"
+    bot.reply_to(message, f"Maintenance mode: <b>{status}</b>")
+    _add_log(f"maintenance: admin={message.from_user.id} mode={'on' if enabled else 'off'}")
+
+
+# =======================
 # VOICE HANDLER (with AI transcription + draft)
 # =======================
 def _run_transcribe_and_draft(temp_path: str, level: str) -> tuple:
@@ -1618,6 +2461,8 @@ Respond with a JSON array of 5 sentences."""
         )
         import json as _json
         data = _json.loads(response.choices[0].message.content.strip())
+        if isinstance(data, dict):
+            return data.get("examples", data.get("sentences", [str(data)]))
         return data if isinstance(data, list) else ["Could not generate examples."]
     except Exception as e:
         return [f"Could not generate examples for '{grammar_point}': {e}"]
