@@ -2536,6 +2536,9 @@ def _format_feedback_with_scores(feedback_text: str, scores: dict) -> str:
 <b>Overall:</b> {score_display.get(round(avg_score), '?')} ({avg_score:.1f}/5)
 """
     return formatted.strip()
+
+
+def _run_draft_feedback_and_score(transcript: str, level: str, task_script: str, example_answers: str = "") -> Tuple[str, dict]:
     """Generate AI feedback + skill scores using the task script and example answers as criteria.
 
     Returns (feedback_text, scores) where scores is a dict with keys:
