@@ -882,6 +882,21 @@ def get_task_script(level: str, task_number: int) -> str:
     return ""
 
 
+def get_task_example_answers(level: str, task_number: int) -> str:
+    """Get the Example Answers for this Task # from the level's Task List sheet."""
+    ws = _get_task_list_worksheet(level)
+    if not ws:
+        return ""
+    for row in ws.get_all_records():
+        try:
+            num = int(row.get("Task #", 0) or 0)
+            if num == task_number:
+                return str(row.get("Example Answers", row.get("example answers", "")) or "").strip()
+        except (TypeError, ValueError):
+            continue
+    return ""
+
+
 # =======================
 # REGISTRATION STATE (for step-by-step signup)
 # =======================
@@ -1641,8 +1656,8 @@ Focus on the most impactful tips for their current level. Keep each tip to 1-2 s
         return "Tips are currently unavailable. Keep practicing regularly!"
 
 
-def _run_draft_feedback_and_score(transcript: str, level: str, task_script: str) -> Tuple[str, dict]:
-    """Generate AI feedback + skill scores using the task script as criteria.
+def _run_draft_feedback_and_score(transcript: str, level: str, task_script: str, example_answers: str = "") -> Tuple[str, dict]:
+    """Generate AI feedback + skill scores using the task script and example answers as criteria.
 
     Returns (feedback_text, scores) where scores is a dict with keys:
     grammar, vocabulary, fluency (each 1-5 int).
@@ -1655,21 +1670,38 @@ def _run_draft_feedback_and_score(transcript: str, level: str, task_script: str)
     try:
         import json as _json
         criteria = f'\nUse this task script as the criteria for feedback:\n"""\n{task_script}\n"""' if task_script else ""
-        prompt = f"""You are an ESL teacher. Student level: {level}.
-Transcript of the student's spoken response: "{transcript}"
-{criteria}
+        examples = f'\nReference these example answers for accuracy and completeness:\n"""\n{example_answers}\n"""' if example_answers else ""
+        prompt = f"""You are an ESL teacher evaluating a {level} level student.
+
+Student's transcript: "{transcript}"
+{criteria}{examples}
+
+Analyze the student's response according to CEFR {level} criteria:
+- Grammar: Appropriate use of structures for level
+- Vocabulary: Word choice and range appropriate for level
+- Fluency: Natural flow and coherence
+
+Identify ALL mistakes and errors made by the student (grammar, vocabulary, pronunciation hints, fluency issues).
+
+Provide detailed, level-appropriate feedback that:
+1. Notes what the student did well
+2. Identifies specific mistakes and areas for improvement
+3. Gives clear, actionable suggestions
+4. References the task requirements and example answers when relevant
+5. Encourages continued progress
+
 Respond ONLY with a valid JSON object (no markdown, no extra text) in this exact format:
 {{
-  "feedback": "<60-100 word encouraging feedback: something positive, 1-2 specific improvements, motivating close>",
+  "feedback": "<80-120 word detailed feedback covering positives, specific mistakes found, improvements needed, and motivation>",
   "grammar": <1-5>,
   "vocabulary": <1-5>,
   "fluency": <1-5>
 }}
-Scores: 1=needs a lot of work, 3=acceptable, 5=excellent."""
+Scores: 1=needs significant work (many errors), 2=developing (some errors), 3=acceptable (few errors), 4=good (minor errors), 5=excellent (few/no errors)."""
         response = openai_client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=300,
+            max_tokens=400,
             temperature=0.7,
             response_format={"type": "json_object"},
         )
@@ -1836,7 +1868,8 @@ def handle_voice(message: types.Message):
             print(f"Failed to send script status to work chat: {e}")
 
         # Message 3: clean AI draft (no header — ready to forward or copy-paste to student)
-        ai_draft, scores = _run_draft_feedback_and_score(transcript, level, task_script)
+        example_answers = get_task_example_answers(level, total_tasks_sent) if total_tasks_sent else ""
+        ai_draft, scores = _run_draft_feedback_and_score(transcript, level, task_script, example_answers)
         feedback_sent = bot.send_message(ADMIN_FEEDBACK_CHAT_ID, ai_draft)
         _student_reply_map[feedback_sent.message_id] = chat_id
         try:
