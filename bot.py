@@ -2285,10 +2285,9 @@ def handle_maintenance(message: types.Message):
 # =======================
 # VOICE HANDLER (with AI transcription + draft)
 # =======================
-def _run_transcribe_and_draft(temp_path: str, level: str) -> tuple:
-    """Returns (transcript, ai_draft)."""
+def _transcribe_audio(temp_path: str) -> str:
+    """Transcribe audio file using Whisper. Returns transcript string."""
     transcript = "[Transcription unavailable - set OPENAI_API_KEY]"
-    ai_draft = "[AI feedback unavailable - set OPENAI_API_KEY]"
     if openai_client:
         try:
             with open(temp_path, "rb") as audio_file:
@@ -2311,19 +2310,14 @@ def _run_transcribe_and_draft(temp_path: str, level: str) -> tuple:
                 transcript = (getattr(transcript_resp, "text", None) or "").strip() or "(empty)"
         except Exception as e:
             transcript = f"[Whisper error: {e}]"
-        try:
-            prompt = f"""You are an ESL teacher. Student level: {level}
-Transcript of their spoken response: "{transcript}"
-Create short, encouraging feedback (60-100 words): positive comment, 1-2 improvements, end with motivation. Friendly tone."""
-            response = openai_client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=150,
-                temperature=0.7,
-            )
-            ai_draft = response.choices[0].message.content.strip()
-        except Exception as e:
-            ai_draft = f"[GPT error: {e}]"
+    return transcript
+
+
+def _run_transcribe_and_draft(temp_path: str, level: str) -> tuple:
+    """Returns (transcript, ai_draft). DEPRECATED: use _transcribe_audio + _run_draft_feedback_and_score instead."""
+    transcript = _transcribe_audio(temp_path)
+    # For practice mode, use the advanced feedback with task context if available
+    ai_draft, _ = _run_draft_feedback_and_score(transcript, level, "", "")
     return transcript, ai_draft
 
 
